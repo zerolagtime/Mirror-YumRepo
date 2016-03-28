@@ -1,7 +1,15 @@
-﻿Param(
+﻿<#
+.NOTES
+    Copyright 2016 Charlie Todd <charlie@zerolagtime.link>
+    Except for portions included wholesale
+    - GZIP compress and decompress - Copyright 2013 Robert Nees - Apache License
+    - 
+#>
+Param(
     [string]$MirrorRoot="http://mirror.cisp.com/CentOS/7",
     [string]$Repo="cloud/x86_64/openstack-liberty",
-    [string]$DeltaZip=$Null
+    [string]$DeltaZip=$Null,
+    [int]$DaysBack=0
 )
 $repomd="repodata/repomd.xml"
 $mirrorFolder=(Get-Location)
@@ -293,15 +301,23 @@ Set-Alias Touch-File Initialize-File -Scope Global
 # --------------------------------------------------------------------------------------------
 $NL = [System.Environment]::NewLine
 Function Create-FileInfo() {
-    Param( [string]$href, [int]$bytes=0, [int]$timestamp=0, [string]$checksum=$null
+    Param( [string]$href, [int]$bytes=0, [int]$timestamp=0, [string]$checksum=$null, 
+           [string]$checksumAlgorithm
     )
+    if ($checksumAlgorithm -notin "sha512,sha384,sha256,sha1") {
+        Write-Debug "Unsupported checksum algorithm $checksumAlgorithm on $href"
+        $checksum=$null
+        $checksumAlgorithm=$null
+    }
      
     $prop=[ordered]@{
             href=$href; bytes=$bytes; 
             timestamp=([TimeZone]::CurrentTimeZone.ToLocalTime('1/1/1970').AddSeconds($timestamp)); 
             checksum=$checksum;
+            checksumAlgorithm=$checksumAlgorithm;
         }
     New-Object -TypeName PSObject -Prop $prop
+
 }
 
 Function Test-DownloadNeeded() {
@@ -317,6 +333,11 @@ Function Test-DownloadNeeded() {
         }
     }
 }
+
+Function Test-DownloadRequested([PSObject]$RepoEntry,[int]$numDays=$DaysBack) {
+    $RepoEntry.timestamp.AddDays($numDays) -ge (Get-Date)
+}
+
 if ($DeltaZip -ne "") {
     if ( (split-path -Parent $DeltaZip) -eq "" ) {
         $DeltaZip = Join-Path (Get-Location) $DeltaZip
@@ -336,15 +357,6 @@ if ($DeltaZip -ne "") {
         $DeltaZip=$Null
     }
 }
-try {
-    $outfile = join-path $mirrorFolder $repomd
-    mkdir (split-path -Parent $outfile) -force | out-Null
-    $response = Invoke-WebRequest -Uri "$MirrorRoot/$Repo/$repomd" -OutFile $outfile
-    $repoXML = [xml] (Get-Content $outfile)
-} catch {
-    Write-Error ("Failed to download {0}: {1}" -f $repomd,$_.toString() )
-    exit 1 
-}
 Function Add-FileToZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,`
         [string]$LocalPath,[string]$InternalPath) {
     $compressionType="Optimal"
@@ -360,15 +372,6 @@ Function Add-FileToZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,`
             $ZipObj.Dispose()
         }
     
-    }
-}
-Add-FileToZip -InternalPath $repomd -LocalPath (join-path $mirrorFolder $repomd)
-$repoXML.repomd.data |% {
-    $info = Create-FileInfo -href $_.location.href -bytes $_.size `
-                            -timestamp $_.timestamp -checksum $_.checksum
-    $URIsToGet.Enqueue( $info ) | Out-Null
-    if ($_.type -eq 'primary') {
-        $FilesToExpand.Enqueue( $info ) | Out-Null
     }
 }
 
@@ -409,14 +412,38 @@ Function Process-DownloadQueue([string]$BaseURI="$MirrorRoot/$Repo",[System.Coll
             Write-Error ( "Error downloading {0}. Requeueing" -f $nextURI.href)
             $RelativeURIQueue.Enqueue( $nextURI )
         }
-        Add-FileToZip -LocalPath $localFile -InternalPath $nextURI.href
+        if ($DeltaZip -ne "") {
+            Add-FileToZip -LocalPath $localFile -InternalPath $nextURI.href
+        }
         $bytesSoFar += $nextURI.bytes
     }
     
     Write-Progress -id 0 -Activity "Download URIs" -Completed
 }
 
-if ($DeltaZip -ne $Null) {
+
+try {
+    $outfile = join-path $mirrorFolder $repomd
+    mkdir (split-path -Parent $outfile) -force | out-Null
+    $response = Invoke-WebRequest -Uri "$MirrorRoot/$Repo/$repomd" -OutFile $outfile
+    $repoXML = [xml] (Get-Content $outfile)
+} catch {
+    Write-Error ("Failed to download {0}: {1}" -f $repomd,$_.toString() )
+    exit 1 
+}
+if ($DeltaZip -ne "") {
+    Add-FileToZip -InternalPath $repomd -LocalPath (join-path $mirrorFolder $repomd)
+}
+$repoXML.repomd.data |% {
+    $info = Create-FileInfo -href $_.location.href -bytes $_.size `
+                            -timestamp $_.timestamp -checksum $_.checksum
+    $URIsToGet.Enqueue( $info ) | Out-Null
+    if ($_.type -eq 'primary') {
+        $FilesToExpand.Enqueue( $info ) | Out-Null
+    }
+}
+
+if ($DeltaZip -ne "") {
     $ZipList = New-Object System.Collections.ArrayList
     $URIsToGet |% { $ZipList.Add($_) | Out-Null }
 }
@@ -458,6 +485,11 @@ foreach ($info in $FilesToExpand) {
                 if (( Test-DownloadNeeded -localFile (Join-Path $mirrorFolder $info.href) -remoteFile $info) -eq $True) {
                     $URIsToGet.Enqueue($info)
                     Write-Debug ("Queued {0}" -f $info.href)
+                } elseif ($DeltaZip -ne "" -and (Test-DownloadRequested -RepoEntry $info -numDays $DaysBack) ) {
+                    Write-Verbose("Queued {0} because it was modified in the last {1} days." -f `
+                        (Split-Path -Leaf $info.href),$DaysBack)
+                    # we only get this far if it has already been successfully downloaded
+                    Add-FileToZip -LocalPath (Join-Path $mirrorFolder $info.href) -InternalPath $info.href
                 } else {
                     #Write-Host "Skipped {0}" -f $info.href)
                 }
@@ -473,9 +505,6 @@ foreach ($info in $FilesToExpand) {
     Remove-Item $nogz
 }
 
-#if ($DeltaZip -ne "") {
-#    $URIsToGet |% { $ZipList.Add($_) }
-#}
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI "$MirrorRoot/$Repo"
 if ($DeltaZip -ne "") {
     $DeltaZipObj.Dispose()
