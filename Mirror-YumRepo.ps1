@@ -1,16 +1,133 @@
 ﻿<#
-.NOTES
-    Copyright 2016 Charlie Todd <charlie@zerolagtime.link>
-    Except for portions included wholesale
-    - GZIP compress and decompress - Copyright 2013 Robert Nees - Apache License
-    - 
+.SYNOPSIS 
+
+    Mirror a YUM repository without having a Linux machine, even host the mirror on IIS. 
+
+.DESCRIPTION
+
+    Some corporate networks are extremely reluctant to give end-point control to arbitrary
+    users.  If your job is to patch Linux machines that are disconnected from the Internet,
+    it can be just a little difficult to get updates as they appear in a YUM repository
+    and copied into your disconnected lab. 
+      
+    This program will connect to the repository, pull down the catalog, and compare the local
+    files with the remote files.  New files are pulled down.  If the DeltaZip command line
+    parameter is provided, then a ZIP file is created with the catalog and all new RPMs,
+    including SRPM and Delta RPMS.  That ZIP file can just be laid on top of an existing
+    repository on the disconnected network and hosted by any web server.  Be sure that
+    any web server setup has a default MIME type that tags files as application/octet-stream.
+    The DaysBack command line option, when paired with the DeltaZip, will put a copy of 
+    all downloads created in the last few days into the ZIP, even if they are already cached
+    locally.  
+
+    Note that files which have been removed from the remote repository may be deleted from the
+    local cache, they will not be deleted from any offline systems. 
+
+.Parameter MirrorRoot
+
+    The URI of a network-accessible repository of multiple branches of repositories.
+
+.Parameter Repository
+
+    The relative path after the -MirrorRoot parameter used to identify which specific repository
+    to mirror.  The local file path structure will mirror this parameter.
+
+.Parameter DeltaZip
+
+    The name of a compressed folder used to store an update to the catalog and any new
+    files since the last run of this program.  The resulting ZIP file can be overlaid
+    onto an existing tree structure on a disconnected system.  See -TrimCache
+    for a technique on removing local files that are no longer on the mirror site.
+
+    This parameter also accepts date and time parameters inside the provided file name.
+    The Unix Time escape characters are braced before and after with hashtag signs.
+    See the examples for potential defaults.  These automatic substitutions allow for
+    a great -SavePreferences setting.
+
+.Parameter DaysBack
+
+    After updating the catalog from the mirror site, add all files found that are
+    newer than the specified number of days to the ZIP file specified with -DeltaZip.
+    The -DeltaZip option must be specified.  This is good for "catching up" a secondary
+    offline system that may have missed an update CD.
+
+.Parameter VerifyAllChecksums
+
+    Using the local database, compute the checksum of all locally cached files.
+    Any files which fail are deleted from the local disk.
+    Pair with -TrimCache to clean up the local disk at the same time.
+
+.Parameter TrimCache
+
+    Using the local database, identify files on disk that are no longer in the catalog
+    and delete them.  Good for offline networks to clean up RPMs no longer being hosted 
+    on the main site.
+
+.Parameter TrimCache
+
+    Save the MirrorDir, Repo, and DeltaZip settings to a preferences file in your %APPDIR%
+    folder.  The next time you call the script, those settings will override the defaults in
+    this application, which makes it nice to call quickly on a daily or weekly basis without
+    having to retype the same parameters every day.  Also nice if your sysadmin doesn't let 
+    you run .bat or .cmd files.
+
+.Parameter ClearPreferences
+
+    Take the settings saved with -SavePreferences and erase them, going back to the script 
+    defaults.  Call this parameter if you are debugging a problem and want to see if the 
+    preferences are getting in the way.
+
+.Parameter Verbose
+
+    This common parameter shows more about what is going on during
+    the evaluate and download process
+
+.Parameter Debug
+
+    This common parameter shows each individual step of the process.
+
+.LINK
+
+    https://github.com/zerolagtime/Powershell
+       
+.Notes 
+    Author		: Charlie Todd <zerolagtime@gmail.com>
+    Version		: 1.0 - 2016/03/28 - Initial release - no Internet access
+    Copyright   : Copyright 2016 Charlie Todd
+                  Licensed under the Apache License, Version 2.0 (the "License");
+    Permissions : Local execution policies may prohibit you from
+                  running this program.  In that case, open a 
+                  PowerShell window and type:
+                    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser
+                  Additionally, this script can be called from a shortcut with
+                  the destination set to
+                    C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass some_folder\Mirror-DisaMcafee.ps1
+    Credit      : GZIP compress and decompress - Copyright 2013 Robert Nees - Apache License 2.0
+                : Jeffery Hicks at mcpmag.com for his PowerShell File Frontier article on ZIP files
 #>
+[CmdletBinding()]
 Param(
-    [string]$MirrorRoot="http://mirror.cisp.com/CentOS/7",
-    [string]$Repo="cloud/x86_64/openstack-liberty",
-    [string]$DeltaZip=$Null,
-    [int]$DaysBack=0
+    [parameter()][string]$MirrorRoot,
+    [parameter()][string]$Repository,
+    [parameter()][string]$DeltaZip,
+    [parameter()][int]$DaysBack,
+    [parameter()][switch]$VerifyAllChecksums,
+    [parameter()][switch]$TrimCache,
+    [parameter()][switch]$SavePreferences,
+    [parameter()][switch]$ClearPreferences
 )
+Set-StrictMode –Version latest
+#Requires -Version 4
+
+$Defaults = @{
+    MirrorRoot="http://mirror.cisp.com/CentOS/7"
+    Repository="cloud/x86_64/openstack-liberty"
+    DeltaZip=""
+}
+$PreferencesFile = Join-Path ([System.Environment]::GetFolderPath(`
+                              [System.Environment+SpecialFolder]::ApplicationData)) `
+                            "yumrepo.json"
+
 $repomd="repodata/repomd.xml"
 $mirrorFolder=(Get-Location)
 
@@ -185,7 +302,6 @@ function Expand-GZip {
     }
 }
 # --------------------------------------------------------------------------------------------
-Set-StrictMode –Version latest
 function Initialize-File{
     <#
         .NOTES
