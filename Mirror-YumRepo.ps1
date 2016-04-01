@@ -50,12 +50,19 @@
     newer than the specified number of days to the ZIP file specified with -DeltaZip.
     The -DeltaZip option must be specified.  This is good for "catching up" a secondary
     offline system that may have missed an update CD.
+    
+    A number between 0 (just what is new during this run) and 90 (inclusive).  Whole days
+    only and it is 24 hours from the time of execution.  So a value of 1 at 3pm will pull
+    all deltas that were not downloaded and, in addition, all files added to the repository
+    starting at 3pm the day before.
 
 .Parameter VerifyAllChecksums
 
     Using the local database, compute the checksum of all locally cached files.
-    Any files which fail are deleted from the local disk.
-    Pair with -TrimCache to clean up the local disk at the same time.
+    Any files which fail are deleted from the local disk. Pair with -TrimCache to clean 
+    up the local disk at the same time.
+
+    This parameter will not be saved with -SavePreferences.
 
 .Parameter TrimCache
 
@@ -63,7 +70,7 @@
     and delete them.  Good for offline networks to clean up RPMs no longer being hosted 
     on the main site.
 
-.Parameter TrimCache
+.Parameter SavePreferences
 
     Save the MirrorDir, Repo, and DeltaZip settings to a preferences file in your %APPDIR%
     folder.  The next time you call the script, those settings will override the defaults in
@@ -77,14 +84,12 @@
     defaults.  Call this parameter if you are debugging a problem and want to see if the 
     preferences are getting in the way.
 
+    This parameter will not be saved with -SavePreferences.
+
 .Parameter Verbose
 
     This common parameter shows more about what is going on during
     the evaluate and download process
-
-.Parameter Debug
-
-    This common parameter shows each individual step of the process.
 
 .LINK
 
@@ -92,7 +97,7 @@
        
 .Notes 
     Author		: Charlie Todd <zerolagtime@gmail.com>
-    Version		: 1.0 - 2016/03/28 - Initial release - no Internet access
+    Version		: 1.1 - 2016/03/31 - Initial release - no Internet access
     Copyright   : Copyright 2016 Charlie Todd
                   Licensed under the Apache License, Version 2.0 (the "License");
     Permissions : Local execution policies may prohibit you from
@@ -101,16 +106,19 @@
                     Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser
                   Additionally, this script can be called from a shortcut with
                   the destination set to
-                    C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass some_folder\Mirror-DisaMcafee.ps1
+                    C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass some_folder\Mirror-YumRepo.ps1
     Credit      : GZIP compress and decompress - Copyright 2013 Robert Nees - Apache License 2.0
                 : Jeffery Hicks at mcpmag.com for his PowerShell File Frontier article on ZIP files
 #>
 [CmdletBinding()]
 Param(
-    [parameter()][string]$MirrorRoot,
+    [parameter()][uri]$MirrorRoot,
     [parameter()][string]$Repository,
     [parameter()][string]$DeltaZip,
-    [parameter()][int]$DaysBack,
+    [ValidateRange(0,90)]
+        [parameter()][int]$DaysBack,
+    [ValidateScript({Test-Path $_ -PathType Container})]
+        [parameter()][string]$CacheFolder=(Get-Location),
     [parameter()][switch]$VerifyAllChecksums,
     [parameter()][switch]$TrimCache,
     [parameter()][switch]$SavePreferences,
@@ -119,17 +127,74 @@ Param(
 Set-StrictMode –Version latest
 #Requires -Version 4
 
+# this list of variables also constrains what can be set in the preferences file
 $Defaults = @{
+    ConfigVersion=1.0
     MirrorRoot="http://mirror.cisp.com/CentOS/7"
     Repository="cloud/x86_64/openstack-liberty"
     DeltaZip=""
+    CacheFolder=(Get-Location).Path
+    TrimCache=$False
 }
 $PreferencesFile = Join-Path ([System.Environment]::GetFolderPath(`
                               [System.Environment+SpecialFolder]::ApplicationData)) `
                             "yumrepo.json"
 
+# Importing preferences is not the same thing as validating them
+# If a value in a preferences was in our globals (ie. parameters), then override it
+Function Import-Preferences([string]$PreferencesFile) {
+    $hash = New-Object System.Collections.Hashtable
+    try { 
+        $parsedJSON = (Get-Content $PreferencesFile | ConvertFrom-Json); # limited methods...
+        $parsedJSON.psobject.properties.getenumerator() |% { $hash.add($_.Name,$_.Value) }
+        if ( ($hash.ContainsKey("ConfigVersion") -eq $false) -or
+             ($hash.ConfigVersion -gt $Defaults.ConfigVersion) ) {
+            throw ( "The configuration file was created with a newer script {0} and is unsupported in this verion {1}." `
+                -f $hash.ConfigVersion,$Defaults.ConfigVersion)
+        }
+        Write-Verbose ("Preferences read from $PreferencesFile, version {0}" -f $hash.ConfigVersion) 
+        # now let us not allow it to rewrite the value in $Defaults
+        $hash.Remove("ConfigVersion")
+    } catch {
+        throw ("Error reading the JSON in the preferences file {0}: {1}" -f `
+            $PreferencesFile, $_.ToString())
+    }
+    foreach ($k in $hash.keys) {
+        if ($Defaults.ContainsKey($k)) { 
+            if ( ( $PSCmdlet.MyInvocation.BoundParameters.ContainsKey($k) ) -eq $False ) { 
+                Set-Variable -scope Script $k -Value $hash.$k
+                Write-Debug "Loading the $k preference from the preference file."         
+            } else {
+                Write-Debug "Leaving the $k preference alone since it was specified on the command line."
+            }
+        } else {
+            throw "Invalid preference '$k'"
+        }
+    } 
+    $True
+}
+
+Function Validate-Preferences() {
+    $allValidPrefs = $True
+    $allValidPrefs
+}
+
+if ((Test-Path $PreferencesFile) -eq $False) {
+    ConvertTo-Json $Defaults | Out-File $PreferencesFile 
+    Write-Verbose "Created a configuration file at $PreferencesFile with default values."
+    Write-Verbose "Override the defaults by setting them on the command line and adding -SavePreferences"
+} else {
+    if ( (Import-Preferences -PreferencesFile $PreferencesFile) -eq $False ) {
+        Write-Error "There was an error reading preferences from $PreferencesFile.  Use -ClearPreferences."
+        exit(1)
+    } 
+    Write-Verbose "Preferences successfully read in from $PreferencesFile"
+}
+if ( (Validate-Preferences()) -eq $False ) {
+    Write-Error "One or more parameters had errors.  See: Get-Help Mirror-YumRepos.ps1"
+    exit(1)
+}
 $repomd="repodata/repomd.xml"
-$mirrorFolder=(Get-Location)
 
 $URIsToGet = New-Object System.Collections.Queue
 $FilesToExpand = New-Object System.Collections.Queue
