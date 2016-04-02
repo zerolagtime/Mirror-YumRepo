@@ -174,8 +174,56 @@ Function Import-Preferences([string]$PreferencesFile) {
     $True
 }
 
+Function Join-Uri {
+    # Adapted from poshcode.org/2097 - code is "free to use for public use" - by Joel Bennett
+    Param( [Parameter()][System.Uri]$base,
+           [Parameter(ValueFromRemainingArguments=$True)][string []] $path
+    )
+    $ofs="/"; $outUri=""
+    if ($base -and $base.AbsoluteUri) {
+        $outUri=($base.AbsoluteUri).Trim("/") + "/"
+    }
+    return [uri]"$outUri$([string]::Join("/", @($path)).TrimStart('/'))"
+}
+
 Function Validate-Preferences() {
     $allValidPrefs = $True
+    if ( ($MirrorRoot -as [System.Uri]).AbsoluteUri -eq $False ) { 
+        $allValidPrefs=$False
+        Write-Error "Parameter -MirrorRoot is not a valid URI"
+    }
+    if ( ($Repository -as [System.Uri]).AbsoluteUri -eq $True ) { 
+        $allValidPrefs=$False
+        Write-Error "Parameter -Repository is not a partial URI"
+    }
+    $UriCheck=Join-Uri $MirrorRoot $Repository $repomd
+    if ( ( (Invoke-WebRequest -Method Head $UriCheck).StatusCode -eq 200 ) -eq $False ) {
+        $allValidPrefs=$False
+        Write-Error "Cannot validate the repository at $UriCheck"
+    } 
+    if ( $DaysBack -lt 0 -or $DaysBack -gt 90 ) {
+        $allValidPrefs=$False
+        Write-Error "Parameter -DaysBack is not between 0 and 90, inclusive"
+    }
+    if ( $DeltaZip ) {
+        $DeltaZip = Resolve-Path $DeltaZip 
+        if ( ( Test-path (Split-Path -Parent $DeltaZip -PathType Container) ) -eq $False ) {
+            $allValidPrefs=$False
+            Write-Error "No parent directory for $DeltaZip"
+        }  
+        if ($DeltaZip -match "%([^%]+)%") {
+            Write-Debug "Substituting date field ${$matches[1]} in $DeltaZip"
+            try { 
+                $pat = $matches[1]
+                $df = Get-Date -Format $pat
+                $DeltaZip -replace "%${pat}%",$df
+                Write-Verbose "The DeltaZip file has computed as $DeltaZip"
+            } catch {
+                $allValidPrefs=$False
+                Write-Error ("Invalid date substitution in -DeltaZip.  See Help.: " -f $_.ToString())
+            }
+        }      
+    }
     $allValidPrefs
 }
 
@@ -190,7 +238,7 @@ if ((Test-Path $PreferencesFile) -eq $False) {
     } 
     Write-Verbose "Preferences successfully read in from $PreferencesFile"
 }
-if ( (Validate-Preferences()) -eq $False ) {
+if ( (Validate-Preferences) -eq $False ) {
     Write-Error "One or more parameters had errors.  See: Get-Help Mirror-YumRepos.ps1"
     exit(1)
 }
@@ -556,7 +604,10 @@ Function Add-FileToZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,`
     }
 }
 
-Function Process-DownloadQueue([string]$BaseURI="$MirrorRoot/$Repo",[System.Collections.Queue]$RelativeURIQueue, [string]$MirrorFolder=(Get-Location),[bool]$Clobber=$False) {
+Function Process-DownloadQueue([string]$BaseURI=(Join-Uri $MirrorRoot $Repository),`
+                [System.Collections.Queue]$RelativeURIQueue, `
+                [string]$MirrorFolder=(Get-Location),`
+                [bool]$Clobber=$False) {
     $entryTotal=$URIsToGet.Count
     $entryCurrent=1
     $totalBytes = 0
@@ -566,7 +617,7 @@ Function Process-DownloadQueue([string]$BaseURI="$MirrorRoot/$Repo",[System.Coll
     while ($RelativeURIQueue.Count -gt 0) {
         Write-Debug ("There are {0} items in the download queue." -f $URIsToGet.Count)
         $nextURI = $RelativeURIQueue.Dequeue()
-        $localFile = (join-path $MirrorFolder $nextURI.href)
+        $localFile = (join-path $CacheFolder $nextURI.href)
         $perc = ([int]($bytesSoFar * 100.0 / $totalBytes))
         Write-Progress -id 0 -Activity "Download URIs" `
                 -Status ("Downloading {0} [{1} of {2}]" -f $nextURI.href,$entryCurrent,$totalURIs) `
@@ -586,7 +637,7 @@ Function Process-DownloadQueue([string]$BaseURI="$MirrorRoot/$Repo",[System.Coll
         try { 
             # mkdir (split-path $nextURI -parent) -force | out-null
             $ProgressPreference = "silentlyContinue"
-            $response = Invoke-WebRequest  -Uri ("$BaseURI/{0}" -f $nextURI.href) -OutFile "$localFile"
+            $response = Invoke-WebRequest  -Uri (Join-Uri $BaseURI $nextURI.href) -OutFile "$localFile"
             $ProgressPreference = "Continue"
             $entryCurrent+=1
         } catch {
@@ -604,16 +655,16 @@ Function Process-DownloadQueue([string]$BaseURI="$MirrorRoot/$Repo",[System.Coll
 
 
 try {
-    $outfile = join-path $mirrorFolder $repomd
+    $outfile = join-path $CacheFolder $repomd
     mkdir (split-path -Parent $outfile) -force | out-Null
-    $response = Invoke-WebRequest -Uri "$MirrorRoot/$Repo/$repomd" -OutFile $outfile
+    $response = Invoke-WebRequest -Uri (Join-Uri $MirrorRoot $Repository $repomd) -OutFile $outfile
     $repoXML = [xml] (Get-Content $outfile)
 } catch {
     Write-Error ("Failed to download {0}: {1}" -f $repomd,$_.toString() )
     exit 1 
 }
 if ($DeltaZip -ne "") {
-    Add-FileToZip -InternalPath $repomd -LocalPath (join-path $mirrorFolder $repomd)
+    Add-FileToZip -InternalPath $repomd -LocalPath (join-path $CacheFolder $repomd)
 }
 $repoXML.repomd.data |% {
     $info = Create-FileInfo -href $_.location.href -bytes $_.size `
@@ -634,7 +685,7 @@ Write-Host "Parsing the metadata for files - this might take a moment"
 foreach ($info in $FilesToExpand) {
     $file = $info.href
     Write-Debug "Expand $file"
-    $nogz = (join-path $mirrorFolder ($file -replace ".gz",""))
+    $nogz = (join-path $CacheFolder  ($file -replace ".gz",""))
     Expand-Gzip $file -NewName $nogz
     $sr = New-Object System.IO.StreamReader($nogz)
     $packageXML=""
@@ -663,14 +714,14 @@ foreach ($info in $FilesToExpand) {
                 $info = Create-FileInfo -href $xml.package.location.href -bytes $xml.package.size.package `
                                         -timestamp $xml.package.time.file -checksum $xml.package.checksum.'#text'
                 $packageXML=""; # stop recording now that it's blank
-                if (( Test-DownloadNeeded -localFile (Join-Path $mirrorFolder $info.href) -remoteFile $info) -eq $True) {
+                if (( Test-DownloadNeeded -localFile (Join-Path $CacheFolder $info.href) -remoteFile $info) -eq $True) {
                     $URIsToGet.Enqueue($info)
                     Write-Debug ("Queued {0}" -f $info.href)
                 } elseif ($DeltaZip -ne "" -and (Test-DownloadRequested -RepoEntry $info -numDays $DaysBack) ) {
                     Write-Verbose("Queued {0} because it was modified in the last {1} days." -f `
                         (Split-Path -Leaf $info.href),$DaysBack)
                     # we only get this far if it has already been successfully downloaded
-                    Add-FileToZip -LocalPath (Join-Path $mirrorFolder $info.href) -InternalPath $info.href
+                    Add-FileToZip -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href
                 } else {
                     #Write-Host "Skipped {0}" -f $info.href)
                 }
@@ -686,7 +737,7 @@ foreach ($info in $FilesToExpand) {
     Remove-Item $nogz
 }
 
-Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI "$MirrorRoot/$Repo"
+Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri $MirrorRoot $Repository)
 if ($DeltaZip -ne "") {
     $DeltaZipObj.Dispose()
     Write-Host "Deltas from this session are in $DeltaZip"
