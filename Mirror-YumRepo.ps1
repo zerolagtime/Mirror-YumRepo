@@ -162,7 +162,7 @@ Param(
     [parameter()][switch]$SavePreferences,
     [parameter()][switch]$ClearPreferences
 )
-Set-StrictMode –Version latest
+Set-StrictMode –Version 4.0
 #Requires -Version 4
 
 # this list of variables also constrains what can be set in the preferences file
@@ -176,6 +176,7 @@ $Defaults = @{
     # TrimCache=$False
 }
 $repomd="repodata/repomd.xml"
+$ScriptWebSession=$Null
 
 $PreferencesFile = Join-Path ([System.Environment]::GetFolderPath(`
                               [System.Environment+SpecialFolder]::ApplicationData)) `
@@ -254,9 +255,17 @@ if ($DeltaZip -ne "") {
     Add-FileToZip -InternalPath $repomd -LocalPath (join-path $CacheFolder $repomd)
 }
 $repoXML.repomd.data |% {
-    $info = Create-FileInfo -href $_.location.href -bytes $_.size `
+    if ($_.HasAttribute("size")) { $size = $_.size } else {$size = 0}; # RHEL 5 file has no size attrib
+    $info = Create-FileInfo -href $_.location.href -bytes $size `
                             -timestamp $_.timestamp -checksum $_.checksum
-    $URIsToGet.Enqueue( $info ) | Out-Null
+    if ($Offline.IsPresent) {
+        if ( (Test-Path (Join-Path $CacheFolder $info.href)) -eq $False ) {
+            Write-Error ("The offline repository is missing {0}.  Processing aborted." -f $info.href)
+            return $False
+        }
+    } else {
+        $URIsToGet.Enqueue( $info ) | Out-Null
+    }
     if ($_.type -eq 'primary') {
         $FilesToExpand.Enqueue( $info ) | Out-Null
     }
@@ -269,21 +278,31 @@ if ($DeltaZip -ne "") {
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True
 
 Write-Host "Parsing the metadata for files - this might take a moment"
+$catalogNum=1
 foreach ($info in $FilesToExpand) {
     $file = Join-Path $CacheFolder $info.href
     Write-Debug "Expand $file"
     $nogz = $file -replace ".gz",""
-    Expand-Gzip $file -NewName $nogz
-    $sr = New-Object System.IO.StreamReader($nogz)
+    Write-Debug "UnGZIP $file to $nogz"
+    try {
+        Expand-Gzip $file -NewName $nogz
+        Write-Debug "Open $nogz for stream reading"
+        $sr = New-Object System.IO.StreamReader($nogz)
+    } catch {
+        Write-Error ("Error decompressing and reading ${file}: {0}" -f $_.ToString() )
+        continue
+    }
     $packageXML=""
     $preamble=""
     $xml = New-Object XML
     $packageNum=0
     $deltaPackages=0
+    $line=0; 
+    $stat="Looking for packages"
     if ($DaysBack -eq 0) {
-        $activity = "Searching through the catalog for packages since last run."
+        $activity = ("Searching through the catalog [{0} of {1}] for packages since last run." -f $catalogNum,$FilesToExpand.Count)
     } else {
-        $activity = "Searching for new packages and those new in the last $DaysBack days."
+        $activity = ("Searching for new packages and those new in the last $DaysBack days in catalog [{0} of {1}]." -f $catalogNum,$FilesToExpand.Count)
     }
     # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
     # approach #2 - try to make a terrible, by-hand extractor of XML data
@@ -291,9 +310,13 @@ foreach ($info in $FilesToExpand) {
     # Below is approach #3, but we have to be somewhat aware of the XML structure/tags
     # with some band-aids to avoid dealing with namespaces
     while (($s = $sr.ReadLine()) -ne $null) {
+        $line+=1
+        $perc = $sr.BaseStream.Position * 100.0 / $sr.BaseStream.Length
+        if ( ($line % 250) -eq 0 ) {
+            Write-Progress -id 10 -Activity $activity -Status $stat -PercentComplete $perc 
+        }
         if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
         if ($s -match "<package( |>)" ) {
-            $perc = $sr.BaseStream.Position * 100.0 / $sr.BaseStream.Length
             if ($DaysBack -eq 0) {
                 $stat = ("Examining package {0}, found {1} new packages to download." -f $packageNum,$URIsToGet.Count)
             } else {
@@ -310,12 +333,14 @@ foreach ($info in $FilesToExpand) {
             # up to just look like normal tags.  Repeat after me: "Not evil"
             $s = $s -replace "<rpm:","<rpm-" -replace "</rpm:","</rpm-"; 
             $packageXML += $s + $NL
+            if ($s -match "<name>(\w+)</name>") { $stat += " Package " + $matches[1] }
         }
         if ($s -match "</package>") {
             try {
                 $xml.LoadXml( $packageXML )
                 $info = Create-FileInfo -href $xml.package.location.href -bytes $xml.package.size.package `
-                                        -timestamp $xml.package.time.file -checksum $xml.package.checksum.'#text'
+                                        -timestamp $xml.package.time.file -checksum $xml.package.checksum.'#text' `
+                                        -checksumAlgorithm $xml.package.checksum.type
                 $packageXML=""; # stop recording now that it's blank
                 if (( Test-DownloadNeeded -localFile (Join-Path $CacheFolder $info.href) -remoteFile $info) -eq $True) {
                     $URIsToGet.Enqueue($info)
@@ -340,6 +365,7 @@ foreach ($info in $FilesToExpand) {
     $sr.Close()
     Write-Progress -id 10 -Activity "Reading in packages" -Completed 
     Remove-Item $nogz
+    $catalogNum+=1
 }
 
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri $MirrorRoot $Repository)
@@ -402,7 +428,7 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri $MirrorRoot $Repositor
         try { 
             # mkdir (split-path $nextURI -parent) -force | out-null
             $ProgressPreference = "silentlyContinue"
-            $response = Invoke-WebRequest  -Uri (Join-Uri $BaseURI $nextURI.href) -OutFile "$localFile"
+            $response = Invoke-WebRequest  -Uri (Join-Uri $BaseURI $nextURI.href) -OutFile "$localFile" -WebSession $ScriptWebSession
             $ProgressPreference = "Continue"
             $entryCurrent+=1
         } catch {
@@ -703,7 +729,7 @@ Function Create-FileInfo() {
     Param( [string]$href, [int]$bytes=0, [int]$timestamp=0, [string]$checksum=$null, 
            [string]$checksumAlgorithm
     )
-    if ($checksumAlgorithm -notin "sha512,sha384,sha256,sha1") {
+    if ($checksumAlgorithm -notin "sha512,sha384,sha256,sha1,sha") {
         Write-Debug "Unsupported checksum algorithm $checksumAlgorithm on $href"
         $checksum=$null
         $checksumAlgorithm=$null
@@ -714,7 +740,15 @@ Function Create-FileInfo() {
             timestamp=([TimeZone]::CurrentTimeZone.ToLocalTime('1/1/1970').AddSeconds($timestamp)); 
             checksum=$checksum;
             checksumAlgorithm=$checksumAlgorithm;
+            mirror_uri=(Join-Uri $MirrorRoot $Repository $href);
         }
+    if ($size -eq 0) {
+        try {
+            $prop.bytes = (Invoke-WebRequest -Uri $prop.mirror_uri.AbsoluteUri -Method HEAD -WebSession $ScriptWebSession ).Headers.'Content-Length'
+        } catch {
+            $size=0
+        }
+    }
     New-Object -TypeName PSObject -Prop $prop
 }
 
@@ -790,9 +824,10 @@ Function Validate-Preferences() {
         Write-Error "Parameter -Repository is not a partial URI"
     }
     $UriCheck=Join-Uri $MirrorRoot $Repository $repomd
-    if ( ( (Invoke-WebRequest -Method Head $UriCheck).StatusCode -eq 200 ) -eq $False ) {
+    if ( ( (Invoke-WebRequest -Method Head $UriCheck -SessionVariable ScriptWebSession).StatusCode -eq 200 ) -eq $False ) {
         $allValidPrefs=$False
         Write-Error "Cannot validate the repository at $UriCheck"
+        $ScriptWebSession=$Null
     } 
     if ( $DaysBack -lt 0 -or $DaysBack -gt 90 ) {
         $allValidPrefs=$False
