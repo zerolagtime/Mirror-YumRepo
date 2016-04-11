@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS 
 
     Mirror a YUM repository without having a Linux machine, even host the mirror on IIS. 
@@ -242,7 +242,7 @@ try {
         Write-Verbose "Offline mode requested.  Repo index available at $outfile"
     } else { 
         Write-Debug "Attempting to download the repository index to $outfile"
-        $repoUri = [uri](Join-Uri $MirrorRoot.AbsoluteUri $Repository $repomd)
+        $repoUri = [uri](Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository $repomd)
         Write-Debug ( "Starting file download from {0}" -f $repoUri.AbsoluteUri)
         $response = Invoke-WebRequest -Uri $repoUri -OutFile $outfile
     }
@@ -258,7 +258,7 @@ $repoXML.repomd.data |% {
     if ($_.HasAttribute("size")) { $size = $_.size } else {$size = 0}; # RHEL 5 file has no size attrib
     $info = Create-FileInfo -href $_.location.href -bytes $size `
                             -timestamp $_.timestamp -checksum $_.checksum
-    if ($Offline.IsPresent) {
+    if ($Offline) {
         if ( (Test-Path (Join-Path $CacheFolder $info.href)) -eq $False ) {
             Write-Error ("The offline repository is missing {0}.  Processing aborted." -f $info.href)
             return $False
@@ -368,7 +368,7 @@ foreach ($info in $FilesToExpand) {
     $catalogNum+=1
 }
 
-Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri $MirrorRoot $Repository)
+Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository)
 if ($DeltaZip -ne "") {
     $DeltaZipObj.Dispose()
     Write-Host "Deltas from this session are in $DeltaZip"
@@ -395,7 +395,7 @@ Function Add-FileToZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,`
     }
 }
 
-Function Process-DownloadQueue([string]$BaseURI=(Join-Uri $MirrorRoot $Repository),`
+Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository),`
                 [System.Collections.Queue]$RelativeURIQueue, `
                 [string]$MirrorFolder=(Get-Location),`
                 [bool]$Clobber=$False) {
@@ -771,7 +771,7 @@ Function Test-DownloadNeeded() {
 Function Import-Preferences([string]$PreferencesFile) {
     $hash = New-Object System.Collections.Hashtable
     try { 
-        $parsedJSON = (Get-Content $PreferencesFile | ConvertFrom-Json); # limited methods...
+        $parsedJSON = (Get-Content -raw $PreferencesFile | ConvertFrom-Json); # limited methods...
         $parsedJSON.psobject.properties.getenumerator() |% { $hash.add($_.Name,$_.Value) }
         if ( ($hash.ContainsKey("ConfigVersion") -eq $false) -or
              ($hash.ConfigVersion -gt $Defaults.ConfigVersion) ) {
@@ -828,6 +828,8 @@ Function Validate-Preferences() {
         $allValidPrefs=$False
         Write-Error "Cannot validate the repository at $UriCheck"
         $ScriptWebSession=$Null
+    } else {
+        $Script:ScriptWebSession = $ScriptWebSession
     } 
     if ( $DaysBack -lt 0 -or $DaysBack -gt 90 ) {
         $allValidPrefs=$False
