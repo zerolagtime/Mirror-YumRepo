@@ -741,10 +741,15 @@ Function Create-FileInfo() {
             checksum=$checksum;
             checksumAlgorithm=$checksumAlgorithm;
             mirror_uri=(Join-Uri $MirrorRoot $Repository $href);
+            local_newer=$False
         }
     if ($size -eq 0) {
         try {
-            $prop.bytes = (Invoke-WebRequest -Uri $prop.mirror_uri.AbsoluteUri -Method HEAD -WebSession $ScriptWebSession ).Headers.'Content-Length'
+            $ProgressPreference = "silentlyContinue"
+            $request = Invoke-WebRequest -Uri $prop.mirror_uri.AbsoluteUri -Method HEAD -WebSession $ScriptWebSession
+            $prop.bytes = $request.Headers.'Content-Length'
+            $prop.local_newer = (Get-Item (join-path $CacheFolder $prop.href)).CreationTime -gt (Get-date $request.Headers.'Last-Modified')
+            $ProgressPreference = "silentlyContinue"
         } catch {
             $size=0
         }
