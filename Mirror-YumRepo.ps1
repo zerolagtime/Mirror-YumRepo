@@ -162,7 +162,7 @@ Param(
     [parameter()][switch]$SavePreferences,
     [parameter()][switch]$ClearPreferences
 )
-Set-StrictMode –Version 4.0
+Set-StrictMode -Version 4.0
 #Requires -Version 4
 
 # this list of variables also constrains what can be set in the preferences file
@@ -208,7 +208,7 @@ if ($SavePreferences -eq $True) {
     $Defaults.Repository = $Repository
     $Defaults.CacheFolder = $CacheFolder
     $Defaults.DeltaZip = $DeltaZip
-    $Defaults.Offline = $Offline.IsPresent
+    $Defaults.Offline = $Offline
     ConvertTo-Json $Defaults | Out-File $PreferencesFile
 }
 
@@ -264,7 +264,12 @@ $repoXML.repomd.data |% {
             return $False
         }
     } else {
-        $URIsToGet.Enqueue( $info ) | Out-Null
+        if (Test-DownloadNeeded -localFile (Join-Path $CacheFolder $info.href) -remoteFile $info) {
+            Write-Verbose ("Queueing {0} for download" -f $info.href) 
+            $URIsToGet.Enqueue( $info ) | Out-Null
+        } else {
+            Write-Verbose ("No need to download {0} as the local copy is up to date." -f $info.href)
+        }
     }
     if ($_.type -eq 'primary') {
         $FilesToExpand.Enqueue( $info ) | Out-Null
@@ -425,15 +430,22 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
         if ( (Test-Path $localPath) -eq $False) {
             mkdir $localPath  | Out-Null
         }
-        try { 
-            # mkdir (split-path $nextURI -parent) -force | out-null
-            $ProgressPreference = "silentlyContinue"
-            $response = Invoke-WebRequest  -Uri (Join-Uri $BaseURI $nextURI.href) -OutFile "$localFile" -WebSession $ScriptWebSession
-            $ProgressPreference = "Continue"
-            $entryCurrent+=1
-        } catch {
-            Write-Error ( "Error downloading {0}. Requeueing" -f $nextURI.href)
-            $RelativeURIQueue.Enqueue( $nextURI )
+        if ($nextURI.local_newer -eq $False) {
+            try { 
+                # mkdir (split-path $nextURI -parent) -force | out-null
+                $ProgressPreference = "silentlyContinue"
+                $response = Invoke-WebRequest  -Uri (Join-Uri $BaseURI $nextURI.href) -OutFile "$localFile" -WebSession $ScriptWebSession
+                $props = Get-Item $localFile
+                $props.LastWriteTime = $nextURI.timestamp
+                $props.CreationTime = $nextURI.timestamp
+                $ProgressPreference = "Continue"
+                $entryCurrent+=1
+            } catch {
+                Write-Error ( "Error downloading {0}. Requeueing" -f $nextURI.href)
+                $RelativeURIQueue.Enqueue( $nextURI )
+            }
+        } else {
+            Write-Verbose ("Local file {0} is the same or newer than the remote file." -f $nextUri.href)
         }
         if ($DeltaZip -ne "") {
             Add-FileToZip -LocalPath $localFile -InternalPath $nextURI.href
@@ -741,15 +753,22 @@ Function Create-FileInfo() {
             checksum=$checksum;
             checksumAlgorithm=$checksumAlgorithm;
             mirror_uri=(Join-Uri $MirrorRoot $Repository $href);
-            local_newer=$False
+            local_newer=$False;
         }
     if ($size -eq 0) {
         try {
             $ProgressPreference = "silentlyContinue"
             $request = Invoke-WebRequest -Uri $prop.mirror_uri.AbsoluteUri -Method HEAD -WebSession $ScriptWebSession
             $prop.bytes = $request.Headers.'Content-Length'
-            $prop.local_newer = (Get-Item (join-path $CacheFolder $prop.href)).CreationTime -gt (Get-date $request.Headers.'Last-Modified')
-            $ProgressPreference = "silentlyContinue"
+            if (Test-Path -PathType Leaf  (join-path $CacheFolder $prop.href) ) {
+                $prop.local_newer = (Get-Item (join-path $CacheFolder $prop.href)).CreationTime -gt (Get-date $request.Headers.'Last-Modified')
+            } else {
+                $prop.local_newer = $False
+            }
+            if ($timestamp -eq 0) {
+                $prop.timestamp = Get-date $request.Headers.'Last-Modified'
+            }
+            $ProgressPreference = "Continue"
         } catch {
             $size=0
         }
@@ -766,7 +785,12 @@ Function Test-DownloadNeeded() {
         if ($info.Length -ne $remoteFile.bytes) {
             $True
         } else {
-            $False
+            if ($remoteFile.timestamp -and
+                    ($info.LastWriteTime -lt $remoteFile.timestamp)) {
+                $True
+            } else {
+                $False
+            }
         }
     }
 }
