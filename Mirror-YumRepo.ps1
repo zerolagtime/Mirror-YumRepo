@@ -101,6 +101,12 @@
 
     This parameter will not be saved with -SavePreferences.
 
+.Parameter PreferencesFile
+
+    The file where preferences are saved.  Set this to either save settings into a particular
+    place or to retrieve them from a group of files.  Good for mirroring repositories as a 
+    collection.
+
 .Parameter Verbose
 
     This common parameter shows more about what is going on during
@@ -160,11 +166,14 @@ Param(
         [parameter()][switch]$TrimCache,
     [parameter()][switch]$Offline,
     [parameter()][switch]$SavePreferences,
-    [parameter()][switch]$ClearPreferences
+    [parameter()][switch]$ClearPreferences,
+    [parameter()][string]$PreferencesFile=(Join-Path ([System.Environment]::GetFolderPath(`
+                              [System.Environment+SpecialFolder]::ApplicationData)) `
+                            "yumrepo.json")
 )
 Set-StrictMode -Version 4.0
 #Requires -Version 4
-
+#$DebugPreference="Continue"
 # this list of variables also constrains what can be set in the preferences file
 $Defaults = @{
     ConfigVersion=1.0
@@ -178,16 +187,15 @@ $Defaults = @{
 $repomd="repodata/repomd.xml"
 $ScriptWebSession=$Null
 
-$PreferencesFile = Join-Path ([System.Environment]::GetFolderPath(`
-                              [System.Environment+SpecialFolder]::ApplicationData)) `
-                            "yumrepo.json"
+
 $NL = [System.Environment]::NewLine
 
+####################################################################################
 # main() function.  treat it as a function so that the reader can follow along at the top
 # and see the supporting functions later.  The last line of the Script is a call to this function.
 Function Main-Mirror-YumRepo {
 
-if ((Test-Path $PreferencesFile) -eq $False -or $ClearPreferences.IsPresent) {
+if ((Test-Path $PreferencesFile) -eq $False -or $ClearPreferences) {
     ConvertTo-Json $Defaults | Out-File -Force $PreferencesFile 
     Write-Verbose "Created a configuration file at $PreferencesFile with default values."
     Write-Verbose "Override the defaults by setting them on the command line and adding -SavePreferences"
@@ -214,6 +222,8 @@ if ($SavePreferences -eq $True) {
 
 $URIsToGet = New-Object System.Collections.Queue
 $FilesToExpand = New-Object System.Collections.Queue
+$FoldersWithPackages = New-Object System.Collections.Hashtable
+$AllRemotePackages = New-Object System.Collections.ArrayList
 
 if ($DeltaZip -ne "") {
     if ( (split-path -Parent $DeltaZip) -eq "" ) {
@@ -228,6 +238,7 @@ if ($DeltaZip -ne "") {
     } 
     try {
         $DeltaZipObj = [System.IO.Compression.ZipFile]::Open($DeltaZip,$mode)
+        Trap {Remove-Variable DeltaZipObj; "Error caught: $_"; break }
         Write-Host "Opened delta ZIP file $DeltaZip in '$mode' mode."
     } catch {
         Write-Error ("Cannot open {0} for '{1}': {2}" -f $DeltaZip,$mode,$_.ToString())
@@ -236,6 +247,7 @@ if ($DeltaZip -ne "") {
 }
 
 try {
+    $FoldersWithPackages.Add( (Split-Path -Parent $repomd), $True) | Out-Null
     $outfile = join-path $CacheFolder $repomd
     mkdir (split-path -Parent $outfile) -force | out-Null
     if ( $Offline -eq $True -and (Test-Path -Path $outfile -PathType Leaf) -eq $True ) {
@@ -280,7 +292,7 @@ if ($DeltaZip -ne "") {
     $ZipList = New-Object System.Collections.ArrayList
     $URIsToGet |% { $ZipList.Add($_) | Out-Null }
 }
-Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True
+Process-DownloadQueue -RelativeURIQueue $URIsToGet 
 
 Write-Host "Parsing the metadata for files - this might take a moment"
 $catalogNum=1
@@ -322,6 +334,7 @@ foreach ($info in $FilesToExpand) {
         }
         if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
         if ($s -match "<package( |>)" ) {
+            Start-Timer -Tag "PackageSnarf"
             if ($DaysBack -eq 0) {
                 $stat = ("Examining package {0}, found {1} new packages to download." -f $packageNum,$URIsToGet.Count)
             } else {
@@ -341,20 +354,26 @@ foreach ($info in $FilesToExpand) {
             if ($s -match "<name>(\w+)</name>") { $stat += " Package " + $matches[1] }
         }
         if ($s -match "</package>") {
+            $delta=Stop-Timer -Tag "PackageSnarf"
             try {
+                Start-Timer -Tag "PackageParse"
                 $xml.LoadXml( $packageXML )
+                $delta=Stop-Timer -Tag "PackageParse" -Description $xml.package.name
                 $info = Create-FileInfo -href $xml.package.location.href -bytes $xml.package.size.package `
                                         -timestamp $xml.package.time.file -checksum $xml.package.checksum.'#text' `
                                         -checksumAlgorithm $xml.package.checksum.type
+                # add the folder with packages to a list of folders we can compare later
+                $FoldersWithPackages[(Split-Path -Parent $xml.package.location.href)] = $True # auto-duplicate remover  
+                $AllRemotePackages.Add($xml.package.location.href) | Out-Null # easily searched with $AllRemotePackages.Contains($file)
                 $packageXML=""; # stop recording now that it's blank
                 if (( Test-DownloadNeeded -localFile (Join-Path $CacheFolder $info.href) -remoteFile $info) -eq $True) {
-                    $URIsToGet.Enqueue($info)
+                    $URIsToGet.Enqueue($info) | Out-Null
                     Write-Debug ("Queued {0}" -f $info.href)
                 } elseif ($DeltaZip -ne "" -and (Test-DownloadRequested -RepoEntry $info -numDays $DaysBack) ) {
                     Write-Verbose("Queued {0} because it was modified in the last {1} days." -f `
                         (Split-Path -Leaf $info.href),$DaysBack)
                     # we only get this far if it has already been successfully downloaded
-                    Add-FileToZip -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href
+                    Add-FileToZip -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href | Out-Null
                     $deltaPackages+=1
                 } else {
                     #Write-Host "Skipped {0}" -f $info.href)
@@ -372,7 +391,10 @@ foreach ($info in $FilesToExpand) {
     Remove-Item $nogz
     $catalogNum+=1
 }
-
+if ($TrimCache) {
+    Write-Verbose "Trimming the cache of the local repository as requested."
+    $numRemoved = Expire-ObsoleteCache  -LocalFileRoot $CacheFolder -FolderList $FoldersWithPackages -RemoteFileList $AllRemotePackages
+}
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository)
 if ($DeltaZip -ne "") {
     $DeltaZipObj.Dispose()
@@ -410,6 +432,7 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
     $RelativeURIQueue |% { $totalBytes += $_.bytes }
     $bytesSoFar=0
     $totalURIs=$RelativeURIQueue.Count
+    $skippedURIs=0
     while ($RelativeURIQueue.Count -gt 0) {
         Write-Debug ("There are {0} items in the download queue." -f $URIsToGet.Count)
         $nextURI = $RelativeURIQueue.Dequeue()
@@ -442,10 +465,11 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
                 $entryCurrent+=1
             } catch {
                 Write-Error ( "Error downloading {0}. Requeueing" -f $nextURI.href)
-                $RelativeURIQueue.Enqueue( $nextURI )
+                $RelativeURIQueue.Enqueue( $nextURI ) | Out-Null
             }
         } else {
             Write-Verbose ("Local file {0} is the same or newer than the remote file." -f $nextUri.href)
+            $skippedURIs += 1
         }
         if ($DeltaZip -ne "") {
             Add-FileToZip -LocalPath $localFile -InternalPath $nextURI.href
@@ -454,6 +478,7 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
     }
     
     Write-Progress -id 0 -Activity "Download URIs" -Completed
+    Write-Host ("Downloaded {0} files." -f ($totalURIs - $skippedURIs))
 }
 
 # --------------------------------------------------------------------------------------------
@@ -513,7 +538,7 @@ function Compress-GZip {
             return
         }
         if (Test-Path -Path $GZipPath -PathType Leaf) {
-            If ($Force.IsPresent) {
+            If ($Force) {
                 if ($pscmdlet.ShouldProcess("Overwrite Existing File @ $GZipPath")) {
                     Touch-File $GZipPath
                 }
@@ -589,7 +614,7 @@ function Expand-GZip {
             return
         }
         if (Test-Path -Path $GZipPath -PathType Leaf) {
-            If ($Force.IsPresent) {
+            If ($Force) {
                 if ($pscmdlet.ShouldProcess("Overwrite Existing File @ $GZipPath")) {
                     Touch-File $GZipPath
                 }
@@ -801,7 +826,7 @@ Function Import-Preferences([string]$PreferencesFile) {
     $hash = New-Object System.Collections.Hashtable
     try { 
         $parsedJSON = (Get-Content -raw $PreferencesFile | ConvertFrom-Json); # limited methods...
-        $parsedJSON.psobject.properties.getenumerator() |% { $hash.add($_.Name,$_.Value) }
+        $parsedJSON.psobject.properties.getenumerator() |% { $hash.add($_.Name,$_.Value) | Out-Null }
         if ( ($hash.ContainsKey("ConfigVersion") -eq $false) -or
              ($hash.ConfigVersion -gt $Defaults.ConfigVersion) ) {
             throw ( "The configuration file was created with a newer script {0} and is unsupported in this verion {1}." `
@@ -891,5 +916,62 @@ Function Validate-Preferences() {
 Function Test-DownloadRequested([PSObject]$RepoEntry,[int]$numDays=$DaysBack) {
     $RepoEntry.timestamp.AddDays($numDays) -ge (Get-Date)
 }
+
+Function Expire-ObsoleteCache([string]$LocalFileRoot,[System.Collections.Hashtable]$FolderList, [System.Collections.ArrayList]$RemoteFileList) {
+    $ToRemoveCount = 0
+    $ToRemove = New-Object System.Collections.Queue
+    Write-Verbose "Searching local filesystem in $LocalFileRoot for obsolete files"
+    foreach ($folder in $FolderList.Keys) {
+        $LocalFolder=Join-Path $LocalFileRoot $folder
+        Get-ChildItem -File -Recurse $LocalFileRoot |% { 
+            $relFile = $_.FullName.Replace("$LocalFileRoot\","")
+            if ($RemoteFileList.Contains($relFile) ) {
+                $ToRemove.Enqueue( $_.FullName ) | Out-Null
+                $ToRemoveCount += 1
+            }
+        }
+    }
+    Write-Verbose ("Found {0} obsolete files from a collection of {1} remote files." -f `
+        $ToRemoveCount, $RemoteFileList.Count )
+    $removed = 0
+    while ($ToRemove.Count -ne 0) {
+        $oneFile = $ToRemove.Dequeue()
+        try {
+            Remove-Item $oneFile
+            Write-Debug "   Deleted $oneFile"
+            $removed += 1
+        } catch {
+            Write-Warning ("Could not delete the local file ${oneFile}: {0}" -f $_.ToString())
+        }
+    }
+    return $removed
+}
+
+$__Timing_active = New-Object System.Collections.Hashtable
+$__Timing_records = New-Object System.Collections.HashTable
+$__Timing_sequence = 1
+Function Start-Timer([string]$Tag) {
+    $__Timing_active[$Tag] = Get-Date
+}
+Function Stop-Timer([string]$Tag,[string]$Description="") {
+    $now = Get-Date
+    if ($__Timing_active.ContainsKey($Tag)) {
+        $delta = $now - $__Timing_active[$Tag]
+        $newTag = $Tag + "-" + $__Timing_sequence.ToString("D6")
+        $__Timing_sequence += 1
+        $__Timing_records[$newTag]=$delta
+        Write-Debug ("Timing tag $newTag took {0} milliseconds ({1} seconds): $Description" -f $delta.TotalMilliseconds,$delta.TotalSeconds)
+        return $delta
+    } else {
+        Write-Warning "Timing for tag $Tag ignored since it was never started."
+    }
+}
+
+#Function Report-Timers([string]$Tag="") {
+#    foreach ($oneTag in ($__Timing_records.Keys | where-object {$_ -matches "$Tag-"} | sort-object ) ) {
+#        $baseTag = $oneTag -replace "-(\d+)",""
+#        $sequence = $Matches[1]
+#    }
+#}
 
 Main-Mirror-YumRepo
