@@ -139,7 +139,7 @@
 
 .Notes 
     Author		: Charlie Todd <zerolagtime@gmail.com>
-    Version		: 1.2 - 2016/04/03
+    Version		: 1.3 - 2016/04/30
     Copyright   : Copyright 2016 Charlie Todd
                   Licensed under the Apache License, Version 2.0 (the "License");
     Permissions : Local execution policies may prohibit you from
@@ -186,7 +186,6 @@ $Defaults = @{
 }
 $repomd="repodata/repomd.xml"
 $ScriptWebSession=$Null
-
 
 $NL = [System.Environment]::NewLine
 
@@ -238,7 +237,7 @@ if ($DeltaZip -ne "") {
     } 
     try {
         $DeltaZipObj = [System.IO.Compression.ZipFile]::Open($DeltaZip,$mode)
-        Trap {Remove-Variable DeltaZipObj; "Error caught: $_"; break }
+        #Trap {Remove-Variable DeltaZipObj; "Error caught: $_"; break }
         Write-Host "Opened delta ZIP file $DeltaZip in '$mode' mode."
     } catch {
         Write-Error ("Cannot open {0} for '{1}': {2}" -f $DeltaZip,$mode,$_.ToString())
@@ -248,6 +247,7 @@ if ($DeltaZip -ne "") {
 
 try {
     $FoldersWithPackages.Add( (Split-Path -Parent $repomd), $True) | Out-Null
+    $AllRemotePackages.Add($repomd) | Out-Null
     $outfile = join-path $CacheFolder $repomd
     mkdir (split-path -Parent $outfile) -force | out-Null
     if ( $Offline -eq $True -and (Test-Path -Path $outfile -PathType Leaf) -eq $True ) {
@@ -264,12 +264,14 @@ try {
     exit 1 
 }
 if ($DeltaZip -ne "") {
+    Delete-FileFromZip -ZipObj $DeltaZipObj -InternalPath $repomd
     Add-FileToZip -InternalPath $repomd -LocalPath (join-path $CacheFolder $repomd)
 }
 $repoXML.repomd.data |% {
     if ($_.HasAttribute("size")) { $size = $_.size } else {$size = 0}; # RHEL 5 file has no size attrib
     $info = Create-FileInfo -href $_.location.href -bytes $size `
                             -timestamp $_.timestamp -checksum $_.checksum
+    $AllRemotePackages.Add($_.location.href) | Out-Null
     if ($Offline) {
         if ( (Test-Path (Join-Path $CacheFolder $info.href)) -eq $False ) {
             Write-Error ("The offline repository is missing {0}.  Processing aborted." -f $info.href)
@@ -292,7 +294,10 @@ if ($DeltaZip -ne "") {
     $ZipList = New-Object System.Collections.ArrayList
     $URIsToGet |% { $ZipList.Add($_) | Out-Null }
 }
-Process-DownloadQueue -RelativeURIQueue $URIsToGet 
+Process-DownloadQueue -RelativeURIQueue $URIsToGet
+if ($DeltaZipObj) {
+    $DeltaZipObj.Dispose()
+} 
 
 Write-Host "Parsing the metadata for files - this might take a moment"
 $catalogNum=1
@@ -304,11 +309,19 @@ foreach ($info in $FilesToExpand) {
     try {
         Expand-Gzip $file -NewName $nogz
         Write-Debug "Open $nogz for stream reading"
-        $sr = New-Object System.IO.StreamReader($nogz)
     } catch {
         Write-Error ("Error decompressing and reading ${file}: {0}" -f $_.ToString() )
+        Start-Sleep -Seconds 3
         continue
     }
+    try {
+        $sr = New-Object System.IO.StreamReader($nogz)
+        trap { $sr.Finalize; Write-Host "StreamReader closed up."; return }
+    } catch {
+        Write-Error ("Error decompressing and reading ${nogz}: {0}" -f $_.ToString() )
+        Start-Sleep -Seconds 3
+        continue
+    }    
     $packageXML=""
     $preamble=""
     $xml = New-Object XML
@@ -316,11 +329,13 @@ foreach ($info in $FilesToExpand) {
     $deltaPackages=0
     $line=0; 
     $stat="Looking for packages"
+    $gatherLines=$False
     if ($DaysBack -eq 0) {
         $activity = ("Searching through the catalog [{0} of {1}] for packages since last run." -f $catalogNum,$FilesToExpand.Count)
     } else {
         $activity = ("Searching for new packages and those new in the last $DaysBack days in catalog [{0} of {1}]." -f $catalogNum,$FilesToExpand.Count)
     }
+    $DebugPreference="Continue"
     # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
     # approach #2 - try to make a terrible, by-hand extractor of XML data
     # approach #3 - suck out just one record at a time, treat it like xml, and move on - SAX like
@@ -333,8 +348,10 @@ foreach ($info in $FilesToExpand) {
             Write-Progress -id 10 -Activity $activity -Status $stat -PercentComplete $perc 
         }
         if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
+        if ($s -match "<name>([^<]+)</name>") { $stat += " Package " + $matches[1] }
         if ($s -match "<package( |>)" ) {
-            Start-Timer -Tag "PackageSnarf"
+            #Start-Timer -Tag "PackageSnarf"
+            $gatherLines=$True
             if ($DaysBack -eq 0) {
                 $stat = ("Examining package {0}, found {1} new packages to download." -f $packageNum,$URIsToGet.Count)
             } else {
@@ -346,19 +363,30 @@ foreach ($info in $FilesToExpand) {
             $packageNum+=1
             continue
         }
-        if ($packageXML.Length -gt 0) {
-            # rather than ensure that namespaces are imported, we doctor them
-            # up to just look like normal tags.  Repeat after me: "Not evil"
-            $s = $s -replace "<rpm:","<rpm-" -replace "</rpm:","</rpm-"; 
-            $packageXML += $s + $NL
-            if ($s -match "<name>(\w+)</name>") { $stat += " Package " + $matches[1] }
+        if ( $s -match "(<rpm:requires[^>]*>|<rpm:conflicts[^>]*>|<rpm:provides[^>]*>)" ) {
+            $gatherLines = $False
+            $s = $s -replace $matches[1],""
+            $packageXML +=  $s + $NL
         }
-        if ($s -match "</package>") {
-            $delta=Stop-Timer -Tag "PackageSnarf"
+        if ( $s -match "(</rpm:requires>|</rpm:requires>|</rpm:provides>)" ) {
+            $gatherLines = $True
+            $s = $s -replace $matches[1],""
+        }
+        if ($gatherLines -eq $True) {
+            $packageXML += $s + $NL
+        }
+        if ($s -match "</package>" -and $gatherLines -eq $True) {
+            #Write-Debug "XML=$packageXML"
+            $gatherLines=$False
+            #$delta=Stop-Timer -Tag "PackageSnarf"
             try {
-                Start-Timer -Tag "PackageParse"
+                #Start-Timer -Tag "PackageParse"
+                # rather than ensure that namespaces are imported, we doctor them
+                # up to just look like normal tags.  Repeat after me: "Not evil"
+                $packageXML = $packageXML  -replace "<rpm:","<rpm-" -replace "</rpm:","</rpm-"; 
+                Write-Progress -id 10 -Activity $activity -Status $stat -PercentComplete $perc
                 $xml.LoadXml( $packageXML )
-                $delta=Stop-Timer -Tag "PackageParse" -Description $xml.package.name
+                #$delta=Stop-Timer -Tag "PackageParse" -Description $xml.package.name
                 $info = Create-FileInfo -href $xml.package.location.href -bytes $xml.package.size.package `
                                         -timestamp $xml.package.time.file -checksum $xml.package.checksum.'#text' `
                                         -checksumAlgorithm $xml.package.checksum.type
@@ -373,6 +401,7 @@ foreach ($info in $FilesToExpand) {
                     Write-Verbose("Queued {0} because it was modified in the last {1} days." -f `
                         (Split-Path -Leaf $info.href),$DaysBack)
                     # we only get this far if it has already been successfully downloaded
+                    Delete-FileFromZip -ZipObj $DeltaZipObj -InternalPath $info.href
                     Add-FileToZip -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href | Out-Null
                     $deltaPackages+=1
                 } else {
@@ -386,6 +415,7 @@ foreach ($info in $FilesToExpand) {
             }
         }
     }
+    $DebugPreference="SilentlyContinue"
     $sr.Close()
     Write-Progress -id 10 -Activity "Reading in packages" -Completed 
     Remove-Item $nogz
@@ -395,7 +425,15 @@ if ($TrimCache) {
     Write-Verbose "Trimming the cache of the local repository as requested."
     $numRemoved = Expire-ObsoleteCache  -LocalFileRoot $CacheFolder -FolderList $FoldersWithPackages -RemoteFileList $AllRemotePackages
 }
+try {
+    if ($DeltaZip -ne "") {
+        $DeltaZipObj = [System.IO.Compression.ZipFile]::Open($DeltaZip,"Update")
+    }
+} catch {
+    Write-Warning ("Could not re-open the zip file ${DeltaZip}: {0}" -f $_.ToString())
+}
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository)
+
 if ($DeltaZip -ne "") {
     $DeltaZipObj.Dispose()
     Write-Host "Deltas from this session are in $DeltaZip"
@@ -417,8 +455,23 @@ Function Add-FileToZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,`
         } catch {
             Write-Error ("Failed to add $InternalPath to the ZIP file: {0}" -f $_.ToString())
             $ZipObj.Dispose()
+            Remove-Variable ZipObj
         }
     
+    }
+}
+
+Function Delete-FileFromZip([System.IO.Compression.ZipArchive]$ZipObj=$DeltaZipObj,[string]$InternalPath) {
+    if ($DeltaZipObj) {
+        $toDelete = New-Object System.Collections.Stack
+        $DeltaZipObj.Entries |% {if ($_ -and $_.FullName -eq $InternalPath) {$toDelete.Push($_) } }
+        # If the file was not in the ZIP, then there is nothing to do here
+        while ($toDelete.Count -gt 0) {
+            Write-Verbose "Deleted $InternalPath from the ZIP (probably so it can be added again)"
+            ($toDelete.Pop()).Delete()
+        }
+    } else {
+        Write-Debug "Cannot delete $InternalPath from ZIP as the ZIP file is not open"
     }
 }
 
@@ -445,9 +498,7 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
         if ((Test-Path $localFile) -eq $True) {
             if ($Clobber -eq $True) {
                 Remove-Item $localFile
-            } else {
-                continue
-            }
+            } 
         }
         $localPath = (split-path -Parent $localFile)
         if ( (Test-Path $localPath) -eq $False) {
@@ -462,6 +513,9 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
                 $props.LastWriteTime = $nextURI.timestamp
                 $props.CreationTime = $nextURI.timestamp
                 $ProgressPreference = "Continue"
+                if ($VerifyAllChecksums -eq $True -and $nextURI.checksum -ne "" -and $nextURI.checksumAlgorithm -ne "none" ) {
+                    Write-Verbose "Verifying checksum on $nextURI.href"
+                }
                 $entryCurrent+=1
             } catch {
                 Write-Error ( "Error downloading {0}. Requeueing" -f $nextURI.href)
@@ -472,6 +526,7 @@ Function Process-DownloadQueue([string]$BaseURI=(Join-Uri ([uri]$MirrorRoot).Abs
             $skippedURIs += 1
         }
         if ($DeltaZip -ne "") {
+            Delete-FileFromZip -ZipObj $DeltaZipObj -InternalPath $nextURI.href
             Add-FileToZip -LocalPath $localFile -InternalPath $nextURI.href
         }
         $bytesSoFar += $nextURI.bytes
@@ -766,10 +821,14 @@ Function Create-FileInfo() {
     Param( [string]$href, [int]$bytes=0, [int]$timestamp=0, [string]$checksum=$null, 
            [string]$checksumAlgorithm
     )
-    if ($checksumAlgorithm -notin "sha512,sha384,sha256,sha1,sha") {
+    if ($checksumAlgorithm -notin "sha512","sha384","sha256","sha1","sha") {
         Write-Debug "Unsupported checksum algorithm $checksumAlgorithm on $href"
         $checksum=$null
         $checksumAlgorithm=$null
+    } else {
+        if ($checksumAlgorithm -eq "sha") {
+            $checksumAlgorithm="sha1"
+        }
     }
      
     $prop=[ordered]@{
@@ -923,15 +982,19 @@ Function Expire-ObsoleteCache([string]$LocalFileRoot,[System.Collections.Hashtab
     Write-Verbose "Searching local filesystem in $LocalFileRoot for obsolete files"
     foreach ($folder in $FolderList.Keys) {
         $LocalFolder=Join-Path $LocalFileRoot $folder
-        Get-ChildItem -File -Recurse $LocalFileRoot |% { 
-            $relFile = $_.FullName.Replace("$LocalFileRoot\","")
-            if ($RemoteFileList.Contains($relFile) ) {
+        Get-ChildItem -File -Recurse $LocalFolder |% { 
+            # Get-ChildItem uses backslashes, but URIs used to populate $RemoteFileList uses forward slashes
+            $relFile = $_.FullName.Replace("$LocalFileRoot\","") -replace "\\","/"
+            if ($RemoteFileList.Contains($relFile) -eq $False) {
+                Write-Debug "  Expire: $relFile"
                 $ToRemove.Enqueue( $_.FullName ) | Out-Null
                 $ToRemoveCount += 1
+            } else {
+                Write-Debug "  Don't Expire: $relFile"
             }
         }
     }
-    Write-Verbose ("Found {0} obsolete files from a collection of {1} remote files." -f `
+    Write-Host ("Found {0} obsolete files from a collection of {1} remote files." -f `
         $ToRemoveCount, $RemoteFileList.Count )
     $removed = 0
     while ($ToRemove.Count -ne 0) {
