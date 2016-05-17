@@ -268,7 +268,7 @@ if ($DeltaZip -ne "") {
     Add-FileToZip -InternalPath $repomd -LocalPath (join-path $CacheFolder $repomd)
 }
 $repoXML.repomd.data |% {
-    if ($_.HasAttribute("size")) { $size = $_.size } else {$size = 0}; # RHEL 5 file has no size attrib
+    if ( ($_ | Get-Member size) -ne $Null ) { $size = $_.size } else {$size = 0}; # RHEL 5 file has no size attrib
     $info = Create-FileInfo -href $_.location.href -bytes $size `
                             -timestamp $_.timestamp -checksum $_.checksum
     $AllRemotePackages.Add($_.location.href) | Out-Null
