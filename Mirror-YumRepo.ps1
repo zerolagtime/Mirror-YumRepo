@@ -56,7 +56,7 @@
     The -DeltaZip option must be specified.  This is good for "catching up" a secondary
     offline system that may have missed an update CD.
     
-    A number between 0 (just what is new during this run) and 90 (inclusive).  Whole days
+    A number between 0 (just what is new during this run) and 120 (inclusive).  Whole days
     only and it is 24 hours from the time of execution.  So a value of 1 at 3pm will pull
     all deltas that were not downloaded and, in addition, all files added to the repository
     starting at 3pm the day before.
@@ -157,7 +157,7 @@ Param(
     [parameter()][uri]$MirrorRoot,
     [parameter()][string]$Repository,
     [parameter()][string]$DeltaZip,
-    [ValidateRange(0,90)]
+    [ValidateRange(0,120)]
         [parameter()][int]$DaysBack,
     [ValidateScript({Test-Path $_ -PathType Container})]
         [parameter()][string]$CacheFolder=(Get-Location),
@@ -297,8 +297,8 @@ if ($DeltaZip -ne "") {
 Process-DownloadQueue -RelativeURIQueue $URIsToGet
 if ($DeltaZipObj) {
     $DeltaZipObj.Dispose()
-} 
-
+    remove-variable -name DeltaZipObj
+}
 Write-Host "Parsing the metadata for files - this might take a moment"
 $catalogNum=1
 foreach ($info in $FilesToExpand) {
@@ -363,12 +363,16 @@ foreach ($info in $FilesToExpand) {
             $packageNum+=1
             continue
         }
+        if ($s -match "libblkid-2\.23\.2-26\.el7_2\.3\.x86_64\.rpm") {
+            Write-Verbose "Found libblkid"
+        }
+
         if ( $s -match "(<rpm:requires[^>]*>|<rpm:conflicts[^>]*>|<rpm:provides[^>]*>)" ) {
             $gatherLines = $False
             $s = $s -replace $matches[1],""
             $packageXML +=  $s + $NL
         }
-        if ( $s -match "(</rpm:requires>|</rpm:requires>|</rpm:provides>)" ) {
+        if ( $s -match "(</rpm:requires>|</rpm:conflicts>|</rpm:provides>)" ) {
             $gatherLines = $True
             $s = $s -replace $matches[1],""
         }
@@ -402,7 +406,7 @@ foreach ($info in $FilesToExpand) {
                         (Split-Path -Leaf $info.href),$DaysBack)
                     # we only get this far if it has already been successfully downloaded
                     Delete-FileFromZip -ZipObj $DeltaZipObj -InternalPath $info.href
-                    Add-FileToZip -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href | Out-Null
+                    Add-FileToZip -ZipObj $DeltaZipObj -LocalPath (Join-Path $CacheFolder $info.href) -InternalPath $info.href | Out-Null
                     $deltaPackages+=1
                 } else {
                     #Write-Host "Skipped {0}" -f $info.href)
@@ -425,6 +429,11 @@ if ($TrimCache) {
     Write-Verbose "Trimming the cache of the local repository as requested."
     $numRemoved = Expire-ObsoleteCache  -LocalFileRoot $CacheFolder -FolderList $FoldersWithPackages -RemoteFileList $AllRemotePackages
 }
+if ($DeltaZipObj) {
+    $DeltaZipObj.Dispose()
+    remove-variable -name DeltaZipObj
+} 
+
 try {
     if ($DeltaZip -ne "") {
         $DeltaZipObj = [System.IO.Compression.ZipFile]::Open($DeltaZip,"Update")
@@ -435,7 +444,7 @@ try {
 Process-DownloadQueue -RelativeURIQueue $URIsToGet -Clobber $True -BaseURI (Join-Uri ([uri]$MirrorRoot).AbsoluteUri $Repository)
 
 if ($DeltaZip -ne "") {
-    $DeltaZipObj.Dispose()
+    try { $DeltaZipObj.Dispose() } catch { }
     Write-Host "Deltas from this session are in $DeltaZip"
 }
 Write-Host "Processing completed."
@@ -944,9 +953,9 @@ Function Validate-Preferences() {
     } else {
         $Script:ScriptWebSession = $ScriptWebSession
     } 
-    if ( $DaysBack -lt 0 -or $DaysBack -gt 90 ) {
+    if ( $DaysBack -lt 0 -or $DaysBack -gt 120 ) {
         $allValidPrefs=$False
-        Write-Error "Parameter -DaysBack is not between 0 and 90, inclusive"
+        Write-Error "Parameter -DaysBack is not between 0 and 120, inclusive"
     }
     if ( $DeltaZip ) {
         $parentDir = (Split-Path -parent $DeltaZip) -replace "^$","."
