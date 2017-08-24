@@ -1,0 +1,27 @@
+{
+	"_comment": "This is a configuration file to detail all yum/dnf repositories to mirror.",
+	"formatVersion": "1",
+	"global": {
+		"cacheRootFolder": "%USERPROFILE%/Downloads/YumMirror/Cache",
+		"simultaneousDownloads": 2,
+		"interFileDelayMilliSeconds": 0,
+		"deltaFolder": "%USERPROFILE%/Downloads/YumMirror/Deltas",
+		"deltasEnabled": true,
+		"deltaMaxMegaBytes": 4000,
+		"logFile": "%USERPROFILE%/Downloads/YumMirror/Logs/yum-mirror-%yyyyMMdd%.log"
+	},
+	"mirrors": [
+		{
+			"title": "CentOS 7 x64 - OS",
+			"shortName": "centos7-os",
+			"mirrorListURI": "http://mirrorlist.centos.org/?release=7&arch=x86_64&repo=os",
+			"enabled": true
+		},
+		{
+			"title": "CentOS 7 x64 - Updates",
+			"shortName": "centos7-updates",
+			"remoteRootURIs": [ "http://mirror.cisp.com/CentOS/7/updates/x86_64" ],
+			"enabled": true
+		}
+	]
+}
