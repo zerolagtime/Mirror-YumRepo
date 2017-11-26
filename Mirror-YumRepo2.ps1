@@ -141,6 +141,11 @@
     mirrored from a very large repository.  Great for offline systems that don't need
     everything.
 
+.Parameter Offline
+
+    Don't update the database.  Only useful to quickly grab the last number of days updates
+    when the local repository has been recently updated.
+
 .Parameter Verbose
 
     This common parameter shows more about what is going on during
@@ -211,6 +216,7 @@ Param(
         [string]$PreferencesFile,
     [parameter()][switch]$NoDeltaZip,
     [string []]$FilePackageListing,
+    [switch]$Offline,
     $Command
 )
 #Requires -Version 4
@@ -236,11 +242,14 @@ end { # show the flow up front, but actually execute it last so that everything 
             -PercentComplete ([int]($repoIdx * 100 / $repoCount)); $repoIdx++
         $mirrorConfig = $config.mirrors | where shortName -eq $repo | select -First 1
         $deltaFiles = Update-MirrorSite -GlobalConfig $config.global -MirrorConfig $mirrorConfig
-        if ($config.deltasEnabled) {
+        $cacheFolder = join-path $config.global.cacheRootFolder $mirrorconfig.shortName
+        if (($config.global | gm -name deltasEnabled) -and $config.global.deltasEnabled) { # TODO - not defined
             try {
-                Generate-DeltaZip -ZipFolder $config.deltaFolder -shortName $repo -Files $deltaFiles -maxBytes ($config.deltaMaxMegaBytes*1024*1024)
+                Generate-DeltaZip -ZipFolder $config.global.deltaFolder -shortName $repo -Files $deltaFiles `
+                        -maxBytes ($config.global.deltaMaxMegaBytes*1024*1024) -rootFolder $cacheFolder
             } catch {
                 Write-Warning "Error creating a delta ZIP.  Sleeping for 10 seconds to allow more updates to be cancelled"
+                Write-Verbose "Error was $($_.tostring())"
                 Start-Sleep -Seconds 10
             }
         }
@@ -267,21 +276,51 @@ Function Dump-RepositoryList($repositories) {
 }
 Function Update-MirrorSite($GlobalConfig,$MirrorConfig) {
     $files=new-object System.Collections.ArrayList
-    if ($mirrorConfig.MirrorListURI) {
-        $mirrorSite=Get-YumMirror -MirrorURI $MirrorConfig.mirrorListURI 
+    if (($mirrorConfig | gm -name MirrorListURI) -and $mirrorConfig.mirrorListURI) {
+        $mirrorSite=Get-YumMirror -MirrorURI $MirrorConfig.mirrorListURI
         $mirrorConfig | Add-Member -NotePropertyName "RemoteRootURIs" -NotePropertyValue @($mirrorSite)
     } else { 
         $mirrorSite = $mirrorConfig.remoteRootURIs[0]
     }
+    $cacheFolder = join-path $GlobalConfig.cacheRootFolder $mirrorConfig.shortName
     $mirrorConfig | Add-Member -NotePropertyName "WebSession" -NotePropertyValue (New-Object Microsoft.PowerShell.Commands.WebRequestSession)
-    $catalogFiles = Get-YumCatalogFiles -mirrorConfig $MirrorConfig -cacheFolder (join-path $GlobalConfig.cacheRootFolder $mirrorConfig.shortName)
-    $catalogFiles |% {$files.Add($_) | out-null}
-    $missingFiles = Identify-MissingDownloads -catalogFiles $catalogFiles 
-    $retrievedFiles = Get-URIs -CacheFolder (join-path $GlobalConfig.cacheRootFolder $mirrorConfig.shortName) `
-        -globalConfig $GlobalConfig
-    $missingFiles |% { 
-        if ($_ -in $retrievedFiles) {
-            $rel = $_ -replace $GlobalConfig.CacheRootFolder,"" -replace "^/",""
+    if (! $script:Offline) {
+        $catalogFiles = Get-YumCatalogFiles -mirrorConfig $MirrorConfig -cacheFolder $cacheFolder
+    } else {
+        $catalogFiles = Get-ChildItem (join-path $cacheFolder "repodata") | select-object -ExpandProperty FullName
+    }
+    $catalogFiles |% {$files.Add(($_.Replace($cacheFolder,"") -replace "^\\","")) | out-null}
+    $allRPMs  = Get-RPMsInCatalog  -mirrorSite (get-random @($mirrorSite)) `
+        -catalogFiles ($catalogFiles  | where {$_ -match "primary\.xml\.gz"}) `
+        -CacheFolder $cacheFolder
+    if (!$allRPMs) {return $null} 
+    $counter=0
+    Write-Progress -id 18 -Activity "Checking cache to avoid re-downloads" -Status "Reading local file list" -PercentComplete 0
+    $allRPMsLessCached = $allRPMS |% {
+        if ($counter++ % 10 -eq 0) {
+            Write-Progress -id 18 -Activity "Checking cache to avoid re-downloads" `
+                -Status "$counter of $($allRPMS.count) - $($_.href)" `
+                -PercentComplete ([int]($counter*100.0/$allRPMS.count))
+        }
+        #$item = $cachedFiles | where FullName -like "*$($_.relativePath)"
+        $item = get-item $_.localPath -ErrorAction SilentlyContinue
+        if (! $item) {
+            $_
+        } elseif ($item -and $item.length -ne $_.bytes) {
+            Write-Warning "Removed partial/corrupted download of $($item.name)"
+            Remove-Item $item.FullName
+            $_
+        }
+        # otherwise, the item is already on disk and should not be downloaded again
+    }
+    Write-Progress -id 18 -Activity "Checking" -Completed
+    $retrievedFiles = Get-URIsInGroups -CacheFolder $cacheFolder `
+        -globalConfig $GlobalConfig -URIs $allRPMsLessCached.mirror_uri
+    if (!$retrievedFiles) {return $null}
+    $allRPMsLessCached |% { 
+        $rel = $_.localpath.replace($cachefolder,"") -replace "^\\",""
+        $rel = $_.relativePath
+        if ($_.localpath -in $retrievedFiles) {
             $files.Add($rel) | out-null
             Write-Verbose "Successfully retrieved $rel"
         } else {
@@ -312,19 +351,19 @@ Function Get-YumCatalogFiles($cacheFolder,$mirrorConfig) {
     $repoMDURI=Join-Uri $mirrorConfig.RemoteRootURIs[0] $relpath
     $repoMDURI | Add-Member -MemberType Noteproperty -Name "relativePath" -Value $relpath
     Get-URIs -CacheFolder $cacheFolder -globalConfig $mirrorConfig -URIs $repoMDURI -overwrite `
-        |% {$files.Add($_) | out-null }
+        |% { $files.Add($_) | out-null }
     # $files just contains the repomd.xml file
     $mirror = get-random $mirrorConfig.RemoteRootURIs
     $catalogEntries = Get-CatalogURIs ( [xml](Get-content $files[0]) )
-    $toExpand = $catalogEntries | where type -in "primary","filelists"
     $toGetFiles = $catalogEntries.href | where { $p = join-path $cachefolder $_; !(test-path -PathType Leaf $p)} 
     $toGet = $toGetFiles |% { 
         $u = Join-Uri $mirror $_  
         $u | Add-Member -MemberType Noteproperty -Name "relativePath" -Value $_
         $u
     }
-
-    Get-URIs -CacheFolder $cacheFolder -globalConfig $mirrorConfig -URIs $toget
+    if ($toget) {
+        Get-URIs -CacheFolder $cacheFolder -globalConfig $mirrorConfig -URIs $toget
+    }
     $catalogEntries |% {join-path $cacheFolder $_.href} |% {$files.Add($_) | out-null}    
     return $files
 }
@@ -345,35 +384,339 @@ Function Get-CatalogURIs([xml]$repoXML) {
     return $objs
 }
 
-Function Get-URIs($CacheFolder,$globalConfig,$URIs,[switch]$overwrite) {
-    # BITS will do the heavy lifting for us
-    $destinations = @{}
-    $destinations = $URIs.relativePath |% { join-path $CacheFolder $_ }  
-    $destinations |% { 
-        $p = split-path -Parent $_
-        if (! (Test-Path -PathType Container $p) ) {
-            Log-Verbose "Making local folder $p"
-            mkdir -force $p  | out-null
+function Get-YumMirror($MirrorURI) {
+    try {
+        $req = Invoke-WebRequest $MirrorURI
+    } catch {
+        Write-Error "Error requesting $($MirrorURI): $($_.toString())"
+        throw
+    }
+    $mirrorList = $req.content -split "`n"
+    return $mirrorList
+}
+
+Function Get-URIsInGroups($CacheFolder,$globalConfig,$URIs,[switch]$overwrite,[int]$groupSize=10) {
+    # It is possible to request too many files through BITS.  We will break it into groups of $groupSize URIs
+    # Fancy trickery from     
+    $script:counter=0;
+    $groups = $URIs | group-object -Property { [math]::Floor($script:counter++ / $groupSize) }
+    $gc = 0
+    if ($overwrite) {
+        $destinations = $groups |%  {
+            if ($groups.count -gt 1) { 
+                Write-Progress -id 20 -Activity "Download $($URIs.count) files in groups" `
+                    -Status "Group $($gc+1) of $($groups.count) ($groupsize files per group)" `
+                    -PercentComplete ([int]($gc*100.0/$groups.count)); $gc++;
+            }
+            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group 
+        }
+    } else {
+        $destinations = $groups |%  { 
+            if ($groups.count -gt 1) { 
+                Write-Progress -id 20 -Activity "Download $($URIs.count) files in groups" `
+                    -Status "Group $($gc+1) of $($groups.count) ($groupsize files per group)" `
+                    -PercentComplete ([int]($gc*100.0/$groups.count)); $gc++;
+            }
+            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group -overwrite
         }
     }
-    if ($overwrite) {
-        $destinations |% {if (Test-Path $_) {Remove-Item -verbose $_ }}
-    }
-    Start-BitsTransfer -Source $URIs -Destination $destinations -TransferType Download -ErrorAction Inquire  
+    Write-Progress -id 20 -Activity "Download in groups" -Completed
     return $destinations
 }
 
-Function Identify-MissingDownloads($catalogFiles) {
-    return $null
-    $items=new-object System.Collections.ArrayList
-        $props = @{
-            "URI"= $uri;
-            "RelPath"= $relPath;
-            "Bytes"= $bytes;
+Function Get-URIs($CacheFolder,$globalConfig,$URIs,[switch]$overwrite) {
+    # BITS will do the heavy lifting for us
+    $destinations = @{}
+    if ( $URIs | gm -Name "relativePath" ) { 
+        $destinations = $URIs.relativePath |% { join-path $cacheFolder $_ } # mainly repomd.xml
+    } else {
+        $destinations = $URIs.localPath 
+    }
+    $folders=@{} 
+    $destinations |% { 
+        $p = split-path -Parent $_
+        $folders.$p = $True
+    } 
+    $folders.Keys |% {
+        if (! (Test-Path -PathType Container $_) ) {
+            Write-Verbose "Making local folder $_"
+            mkdir -force $_  | out-null
         }
-        $obj = new-object -TypeName System.Management.Automation.PSCustomObject -Property $props
-        $items.Add($obj) | out-null
-    return $items
+    }
+    if ($overwrite) { # mainly used to forcefully reload catalog files which are small
+        $destinations |% {if (Test-Path $_) {Remove-Item -verbose $_ }}
+    }
+    try {
+        Start-BitsTransfer -Source $URIs -Destination $destinations -TransferType Download -ErrorAction Inquire  
+    } catch {
+        Write-Warning "BITS failed to download files. Cause: $($_.toString()) (see https://msdn.microsoft.com/en-us/library/windows/desktop/aa362823(v=vs.85).aspx)"
+        $destinations=$null
+    }
+    return $destinations
+}
+
+Function Get-RPMsInCatalog($catalogFiles,$mirrorSite,$CacheFolder,$DaysBack=$DaysBack) {
+    $allRPMs = New-Object System.Collections.ArrayList
+    $timesPast = (get-date (get-date -format "MM/dd/yyyy")).adddays(-$DaysBack); # 12:00am today - days back
+    foreach ($cf in $catalogFiles) {
+        $expandedCF = Expand-CatalogFile -PathName $cf
+        if (! $expandedCF) {
+            Write-Warning "Error decompressing $cf - it is likely that no files will be found."
+            return $Null
+        }
+        try {
+            $counter=0
+            $sr = New-Object System.IO.StreamReader($expandedCF) 
+            $lastPreview=get-date
+            while (($rpmBlock = Get-RPMBlockFromStream -streamReader $sr) -ne $Null) {
+                $perc = $sr.BaseStream.Position * 100.0 / $sr.BaseStream.Length
+                $PackageName = "{0} v{1} - {2}" -f $rpmBlock.package.name, $rpmBlock.package.version.ver, `
+                    $(if($rpmBlock.package.summary.length -gt 30) { 
+                        $rpmBlock.package.summary.substring(0,27) + "..." 
+                     } else {
+                        $rpmBlock.package.summary
+                     })
+                if ($counter++ % 10 -eq 0 -or ((get-date)-$lastPreview).totalSeconds -gt 1) {
+                    Write-Progress -id 10 -Activity "Reading RPM records from $(split-path -leaf $cf)" `
+                        -Status "Parsing $PackageName" -PercentComplete $perc
+                }
+                if($DaysBack) {
+                    $fileDate = (get-date '1/1/1970 12:00am').addseconds($rpmblock.package.time.file)
+                    if ( $fileDate -lt $timesPast ) {
+                        continue; # skip files older than $DaysBack
+                    }
+                }
+             $t = measure-command {
+                $info = Create-FileInfo -href $rpmBlock.package.location.href -bytes $rpmBlock.package.size.package `
+                                            -timestamp $rpmBlock.package.time.file -checksum $rpmBlock.package.checksum.'#text' `
+                                            -checksumAlgorithm $rpmBlock.package.checksum.type -MirrorSite $mirrorSite `
+                                            -relativePath $rpmBlock.package.location.href `
+                                            -localPath (join-path $CacheFolder $rpmBlock.package.location.href)
+            }
+            #Write-Verbose "Create-FileInfo took a total of $($t.totalMilliseconds)"
+               $allRPMs.Add($info) | out-null
+               $lastPreview=get-date
+            }
+        } catch {
+            Write-Warning "An error occurred while processing a catalog file.  The package list may be incomplete. $($_.tostring())"
+        } Finally { 
+            $sr.Close(); 
+            Write-Host "Finished reading from expanded catalog file $cf."; 
+        }
+    }
+    Write-Progress -id 10 -Activity "Reading RPM records" -Completed
+    Remove-Item $expandedCF
+    return $allRPMs
+}
+
+Function Get-RPMBlockFromStreamOld($streamReader) {
+    # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
+    # approach #2 - try to make a terrible, by-hand extractor of XML data
+    # approach #3 - suck out just one record at a time, treat it like xml, and move on - SAX like
+    # Below is approach #3, but we have to be somewhat aware of the XML structure/tags
+    # with some band-aids to avoid dealing with namespaces
+    # Input variable is a StreamReader - don't want to suck in the whole file
+    $xml = New-Object XML
+    $packageXML=""
+    $preamble=""
+    $packageNum=0
+    $line=0; 
+    $gatherLines=$False
+    $NL="`n"; $tick=0
+    $result=$null
+    if (! (get-variable -scope script | where name -eq "__regexRPM" )) {       
+        $script:__regexRPM = @{
+            regexName=[regex]"<name>([^<]+)</name>";
+            regexPackageOpen=[regex]"<package( |>)";
+            regexIgnoreCrossref=[regex]"(<rpm:requires[^>]*>|<rpm:conflicts[^>]*>|<rpm:provides[^>]*>)";
+            regexSkipFiles=[regex]"<file[^>]*>.*</file>";
+            regexEmptyLine=[regex]"^\s*$";
+            regexCrossrefClose=[regex]"(</rpm:requires>|</rpm:requires>|</rpm:provides>)";
+            regexPackageClose=[regex]"</package>";
+            regexRPMOpen=[regex]"<rpm:";
+            regexRPMClose=[regex]"</rpm:";
+        }
+    }
+    $keepReading=$True
+    $totalIORead=0;
+    $tt = measure-command {
+    while ($KeepReading) {
+        $t = measure-command {$keepReading = ($s = $streamReader.ReadLine()) -ne $null }
+        $totalIORead += $t.totalmilliseconds
+        if ($keepReading -eq $false) { 
+            break }
+        $line+=1
+        #$perc = $streamReader.BaseStream.Position * 100.0 / $streamReader.BaseStream.Length
+        #if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
+        if ($s -match $script:__regexRPM.regexName) {  if ($matches[1] -like "kernel*") {
+            $tick = 1 }
+        }
+        if ($s -match $script:__regexRPM.regexPackageOpen ) {
+            $gatherLines=$True
+            $packageXML=$preamble  + $s + $NL
+            $packageNum+=1
+            continue
+        }
+        if ( $s -match $script:__regexRPM.regexIgnoreCrossref ) {
+            $gatherLines = $False
+            $s = $s -replace $matches[1],""
+            $packageXML +=  $s + $NL
+        }
+        $s = $s -replace $script:__regexRPM.regexSkipFiles,"" -replace $script:__regexRPM.regexEmptyLine,""
+        if ( $s -match $script:__regexRPM.regexCrossrefClose ) {
+            $gatherLines = $True
+            $s = $s -replace $matches[1],""
+        }
+        if ($gatherLines -eq $True -and $s -ne $NL) {
+            $packageXML += $s + $NL
+        }
+        if ($s -match $script:__regexRPM.regexPackageClose -and $gatherLines -eq $True) {
+            $gatherLines=$False
+            if ($tick -and $tick -eq 1) {
+                #Start-Sleep -Milliseconds 10
+            } 
+            try {
+                # rather than ensure that namespaces are imported, we doctor them
+                # up to just look like normal tags.  Repeat after me: "Not evil, but faster and cleaner code"
+                # since strings are easier to mangle than multiple namespace XML structures are to parse.
+                # and while we're at it, delete blank lines
+                $t = measure-command {
+                    $packageXML = ($packageXML  -replace $script:__regexRPM.regexRPMOpen,"<rpm-" `
+                            -replace $script:__regexRPM.regexRPMClose,"</rpm-")  `
+                            -creplace '(?m)^\s*\r?\n',''; 
+                    $xml.LoadXml( $packageXML )}
+                #Write-Verbose ("Parse Factor: {0,5}" -f [int]($t.TotalMilliseconds*1000/$packageXML.length))
+                $result=$xml
+                break
+            } catch {
+                Write-Error "Error reading XML from a catalog file, ending at line $line"
+                $result= $null
+                break
+            }
+        }
+    } # end of the while loop
+    } # end of measure command
+    #Write-Verbose ("Read/Block factor: {0,5} ({1})" -f `
+    #        [int]($tt.TotalMilliseconds*1000/$line), $result.package.name)
+    return $result
+}
+Function Get-RPMBlockFromStream($streamReader) {
+    # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
+    # approach #2 - try to make a terrible, by-hand extractor of XML data
+    # approach #3 - suck out just one record at a time, treat it like xml, and move on - SAX like
+    # Below is approach #3, but we have to be somewhat aware of the XML structure/tags
+    # with some band-aids to avoid dealing with namespaces
+    # Input variable is a StreamReader - don't want to suck in the whole file
+    $xml = New-Object XML
+    $packageXML=""
+    $line=0; 
+    $gatherLines=$False
+    $NL="`n"; 
+    $keepReading=$True
+    $totalIORead=0;
+    if (! (get-variable -scope script | where name -eq "__regexRPM" )) {       
+        $script:__regexRPM = @{
+            regexPackageOpen=[regex]"<package( |>)";
+            regexPackageClose=[regex]"</package>";
+            regexPackageOpenClose=[regex]"<[/]?package( |>)";
+        }
+    }
+    $lines = new-object System.Collections.ArrayList
+    $tt = measure-command {
+    while (($s = $streamReader.ReadLine()) -ne $null) {
+        if ($lines.count -gt 5000 -and $lines.count % 250 -eq 0) { 
+            Write-Host "Delays in reading: Line #$($lines.count)" }
+        #$perc = $streamReader.BaseStream.Position * 100.0 / $streamReader.BaseStream.Length
+        #if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
+        #if ($s -match $script:__regexRPM.regexName) {  if ($matches[1] -like "kernel*") {
+        #    $tick = 1 }
+        #}
+        if ($s -match $script:__regexRPM.regexPackageOpenClose ) {
+            if ($gatherLines -eq $False) { 
+                $gatherLines=$True
+            } else {
+                $gatherLines=$False
+                $lines.Add($s) | Out-Null
+                break
+            }
+        }
+        if ($gatherLines) { 
+            $lines.Add($s) | Out-Null
+        }
+    }
+    $packageXML = $lines -join $NL
+    $packageXML = $packageXML -replace "(?s)<(file)[^>]*>.*?</file>","" `
+            -replace "(?s)<(rpm:requires)[^>]*>.*?</rpm:requires>","" `
+            -replace "(?s)<(rpm:provides)[^>]*>.*?</rpm:provides>","" `
+            -replace "(?s)<(rpm:conflicts)[^>]*>.*?</rpm:conflicts>","" `
+            -replace "(?s)<(rpm:obsoletes)[^>]*>.*?</rpm:obsoletes>","" `
+            -replace "(?s)<(format)[^>]*>.*?</format>","" `
+            -creplace '(?m)^\s*\r?\n','' -replace "<rpm:","<rpm-" -replace "</rpm:","</rpm-"
+    try {
+        # rather than ensure that namespaces are imported, we doctor them
+        # up to just look like normal tags.  Repeat after me: "Not evil, but faster and cleaner code"
+        # since strings are easier to mangle than multiple namespace XML structures are to parse.
+        # and while we're at it, delete blank lines
+        $t = measure-command {
+            #$packageXML = ($packageXML  -replace $script:__regexRPM.regexRPMOpen,"<rpm-" `
+            #        -replace $script:__regexRPM.regexRPMClose,"</rpm-")  `
+            #        -creplace '(?m)^\s*\r?\n',''; 
+            $xml.LoadXml( $packageXML )}
+        #Write-Verbose ("Parse Factor: {0,5}" -f [int]($t.TotalMilliseconds*1000/$packageXML.length))
+        $result=$xml
+        #break
+    } catch {
+        Write-Error "Error reading XML from a catalog file, ending at line $line"
+        $result= $null
+        #break
+    }
+    } # end of measure command
+    Write-Verbose ("Read/Block factor: {0,5} ({1})" -f `
+            [int]($tt.TotalMilliseconds*1000/$lines.count), $result.package.name)
+    remove-variable lines
+    return $result
+}
+
+# pass in pieces from an RPM XML blob as presented in the catalog file
+Function Create-FileInfo() {
+    Param( [string]$href, [int]$bytes=0, [int]$timestamp=0, [string]$checksum=$null, 
+           [string]$checksumAlgorithm,[uri]$mirrorSite,[string]$relativePath,[string]$localPath
+    )
+    if ($checksumAlgorithm -notin "sha512","sha384","sha256","sha1","sha") {
+        Write-Debug "Unsupported checksum algorithm $checksumAlgorithm on $href"
+        $checksum=$null
+        $checksumAlgorithm=$null
+    } else {
+        if ($checksumAlgorithm -eq "sha") {
+            $checksumAlgorithm="sha1"
+        }
+    }
+    # since we need to keep things relative in the cache
+    $prop=[ordered]@{
+            href=$href; bytes=$bytes; 
+            timestamp=([TimeZone]::CurrentTimeZone.ToLocalTime('1/1/1970').AddSeconds($timestamp)); 
+            checksum=$checksum;
+            checksumAlgorithm=$checksumAlgorithm;
+            mirror_uri=(Join-Uri $Mirrorsite $href);
+            local_newer=$Null;
+            relativePath=$relativePath;
+            localPath=$localPath;
+        }
+    $prop.mirror_uri | Add-Member -MemberType NoteProperty -Name "relativePath" -Value $relativePath 
+   if ($bytes -eq 0) { # typically only with really old catalog files - ask the website for download info
+        try {
+            $ProgressPreference = "silentlyContinue"
+            $request = Invoke-WebRequest -Uri $prop.mirror_uri.AbsoluteUri -Method HEAD -WebSession $ScriptWebSession
+            $prop.bytes = $request.Headers.'Content-Length'
+            if ($timestamp -eq 0) {
+                $prop.timestamp = Get-date $request.Headers.'Last-Modified'
+            }
+            $ProgressPreference = "Continue"
+        } catch {
+            $prop.bytes=0
+        }
+    }
+    New-Object -TypeName PSObject -Prop $prop
 }
 
 Function Parse-PreferencesJSON($file) {
@@ -456,6 +799,141 @@ Consider this certificate to be "pinned," which also avoids man-in-the-middle at
     }
 }
 
+Function Expand-CatalogFile($PathName,$TempFolder=$env:TMP) {
+    $DestFile = join-path $tempFolder ("yumrepo-{0}.xml" -f ([guid]::NewGuid()))
+    Expand-GZip -NewName $DestFile -FullName $PathName
+    if ((Test-Path $DestFile) -and (get-item $DestFile).Length -gt 0) {
+        return $DestFile
+    } else {
+        Write-Warning "Error decompressing $PathName to $Destfile."
+        start-sleep -Seconds 5
+        return $null
+    }
+}
+
+Function Generate-DeltaZip ([string]$ZipFolder,[string]$shortName,[string []]$Files,[int64]$maxBytes=(640*1024*1024),[string]$rootFolder) {
+    # assumptions: 
+    # 1. Files are not compressible - RPMs and GZ files are expected
+    # 2. ZipFolder is writable
+    # 3. Built-in Compress-Archive will not retain the needed directory structure
+    try {Add-Type -AssemblyName System.Io.Compression.Filesystem} catch {Write-Verbose "Zip file support already loaded.  Reusing last install."}
+    $rearranged = Split-FilesForZipping -cachePath $rootFolder -files $Files -maxBytes $maxBytes
+    foreach ($collection in $rearranged) {
+        $zipFile = Get-NextZipFile -ZipFolder $ZipFolder -shortName $shortName
+        # add the $collection of files to the zipFile
+        $result=New-ZipFile -FilePath $zipFile -files $collection -cacheFolder $rootFolder
+    }
+}
+
+# example on run #1: C:\repos-01.zip
+# example on run #2: C:\repos-02.zip
+# This function has side effects and does not return the same result each time.
+Function Get-NextZipFile([string]$ZipFolder,[string]$shortName) {
+    if (! (get-variable -Scope Script | where Name -eq "__zipPartIndex" ) ) {
+        $script:__zipPartIndex=1
+    }
+    $pattern = join-path $ZipFolder "$shortName-{0:D2}.zip" 
+    Write-Verbose ("Checking for $shortName-{0:D2}.zip" -f $script:__zipPartIndex)
+    while ((test-path ($pattern -f $script:__zipPartIndex)) -eq $True) {
+        Write-Verbose ("Skipping over existing archive $shortName-{0:D2}.zip" -f $script:__zipPartIndex)
+        $script:__zipPartIndex++
+    }
+    return ($pattern -f $script:__zipPartIndex++)
+}
+
+Function Split-FilesForZipping([string]$cachePath,[string []]$files,[int64]$maxBytes) {
+    $ListofLists = new-object System.Collections.ArrayList
+    $subList = new-object System.Collections.ArrayList
+    $runningBytes=0;
+    foreach ($f in $files) {
+        $fullPath = $f
+        if ($cachePath) { $fullPath = join-path $cachePath $f }
+        $info = get-item $fullPath 
+        $bytes = $info.length
+        # 1:1 default.  1:2 (0.5) is 50% file reduction
+        switch -regex ($info.Extension) {
+            "\.(rpm|RPM|gz|GZ|bz2|BZ2)" { $compression = 1.0; break }
+            "\.(jpg|JPG|png|PNG|mp4|MP4|m4v|M4V|avi|AVI)" { $compression = 1.0; break }
+            ".*" { $compression = 0.7 }
+        }
+        $runningBytes += $bytes * $compression
+        if ($runningBytes -gt $maxBytes) {
+            $ListofLists.Add($subList) | out-null
+            $subList = new-object System.Collections.ArrayList
+            $runningBytes = $bytes * $compression
+        } 
+        $subList.Add($f) | Out-Null
+    }
+    $ListofLists.Add($subList) | Out-Null
+    , $ListofLists; # weird Powershell behavior causes a list of 1 sublist to get unrolled
+}
+
+# Create the zip file for detla files
+Function New-ZipFile([string]$FilePath,[string []]$Files,[string]$CacheFolder) {
+    $openMethod = "Create"
+    if ( (Test-Path -Path $FilePath -PathType Leaf) -eq $True ) {
+        Write-Warning "ZipFIle $FilePath - we will add files to it"
+        $openMethod = "Update"
+    }
+    $parentFolder = split-path -Parent $FilePath
+    if ( (Test-Path -Path $parentFolder -PathType Container) -eq $False ) {
+        Write-Verbose "Making folder for delta zip files: $parentFolder"
+        New-Item -Path $parentFolder -Force -ItemType Directory
+    }
+    try {
+        $ZipObj = [System.IO.Compression.ZipFile]::Open($FilePath,$openMethod)
+    } catch {
+        Write-Warning "Error creating ZipFile $($FilePath): $($_.tostring())"
+        return $_.tostring()
+    }
+    foreach ($file in $Files) {
+        # strip off the cache folder from the name so that the zip file has clean, relative paths
+        $fullPath = join-path $CacheFolder $file
+        if ( (Test-ReadAccess $fullPath) -eq $True ) {
+            $result = Add-ToOpenZip -ZipObj $ZipObj -localFile $fullPath -internalFile $file
+        } else {
+            Write-Warning "Cannot open $file to add it to $FilePath - permission denied"
+        }
+    }
+    $ZipObj.Dispose()
+    return $True
+}
+ 
+Function Test-ReadAccess([string]$FilePath) {
+    # see if the user can read a file, returning $False if they can't or $True if they can
+    if ( (Test-Path $FilePath) -eq $False ) {
+        return $False
+    }
+    $user = "{0}\{1}" -f $env:USERDOMAIN,$env:USERNAME
+    try {$acls = get-acl $FilePath } catch {return $False}
+    $aclsWithRead = $acls.access | where { $_.identityreference -eq $user -and $_.AccessControlType -eq "Allow" `
+            -and $_.FileSystemRights -match "(FullControl|Read.*)" }
+    if ($aclsWithRead.gettype().name -eq "FileSystemAccessRule"  -or `
+        $aclsWithRead.gettype().name -eq "FileSecurity" -or `
+        $aclsWithRead.count -gt 0) {
+        return $True
+    }
+    return $False
+}
+
+Function Add-ToOpenZip([System.IO.Compression.ZipArchive]$ZipObj,[string]$localFile,$internalFile) {
+    $compressionType="Optimal"
+    if ($InternalFile -cmatch "(.rpm$|.gz$|.bz2$|.drpm$|.srpm$|.jpg$|.png$|.avi$|.mkv$|.mp4$)" ) {
+        $compressionType="NoCompression"; # system.io.compression.compressionlevel
+    }
+    if ( $ZipObj -ne "" ) {
+        try {
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($ZipObj, $localFile,`
+                $InternalFile,$compressionType) | Out-Null
+        } catch {
+            throw ("Failed to add $InternalFile to the ZIP file: {0}" -f $_.ToString())
+        }
+    
+    } else {
+        throw "Failed to add $internalFile to a Zip file because the handle to the open Zip file was lost."
+    }
+}
+
 ############## Generic functions included inline to keep everything in one file #############
 # from stackoverflow at https://stackoverflow.com/a/22236908/3945606
 function Get-HttpsPublicKeyCert
@@ -500,6 +978,20 @@ function Get-HttpsPublicKeyCert
     
     #$key = $servicePoint.Certificate.GetPublicKey()
     #$key
+}
+
+Function Clean-TempFolder($prefix="yumrepos-",$suffix=".xml") {
+    $c = get-childitem $env:TMP -filter "$($prefix)*$($suffix)"
+    if ($c) {
+        Write-Warning "Found $($c.count) stale files in $($env:TMP).  Removing them if possible."
+        $c | Remove-Item -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+        $c |% {if (Test-Path $_.fullname) {
+                Write-Warning "Failed to delete $($_.name).  May be locked for permissions are messed up."
+           }
+        }
+        return $c.count
+    }
+    return 0
 }
 
 # from https://github.com/patrickhuber/Powershell/blob/master/IO/Join-Uri.ps1
@@ -800,5 +1292,126 @@ function Initialize-File{
     end {
     }
 }
+# --------------------------------------------------------------------------------------------
+function Initialize-File{
+    <#
+        .NOTES
+            Copyright 2013 Robert Nees
+            Licensed under the Apache License, Version 2.0 (the "License");
+            http://sushihangover.blogspot.com
+        .SYNOPSIS
+            touch-file -- change file access and modification times
+        .DESCRIPTION
+         The touch utility sets the modification and access times of files.  If any file does not exist, 
+         it is created with default permissions. (see examples)
+     
+            -a (AccessTime) Change just the access time of the file.
+            -c (Create) Do not create the file if it does not exist.  The touch utility does not treat 
+                this as an error.  No error messages are displayed and the exit value is not affected.
+            -f (Force) Attempt to force the update, even if the file permissions do not currently permit 
+                it. FYI: Only valid on file creation!
+            -m (ModificationTime) Change just the modification time of the file.
+            -n (CreationTime) Change just the creation time of the file (when it was 'n'ew).
+            -r (Replace) Use the access and modifications times from the specified file instead of the 
+                current time of day.
+            -t (Time) Change the access and modification times to the specified time instead of the 
+                current time of day.  The argument is of the form of a .Net DateTime string
+        .EXAMPLE
+            TODO : Add Examples
+        .LINK
+            http://sushihangover.blogspot.com
+    #>
+    [cmdletbinding(SupportsShouldProcess=$True)]
+    Param(
+        [Parameter(Mandatory=$true,ValueFromPipeline=$True)][String]$FileName,
+        [Parameter(Mandatory=$false)][Alias('r')][String]$Replace = "",
+        [Parameter(Mandatory=$false)][Alias('t')][String]$Time = "",
+        [Parameter(Mandatory=$false)][Alias('c')][Switch]$Create,
+        [Parameter(Mandatory=$false)][Alias('a')][Switch]$AccessTime,
+        [Parameter(Mandatory=$false)][Alias('m')][Switch]$ModificationTime,
+        [Parameter(Mandatory=$false)][Alias('n')][Switch]$CreationTime,
+        [Parameter(Mandatory=$false)][Alias('f')][Switch]$Force
+    )
+    begin {
+        function Update-FileSystemInfo([System.IO.FileSystemInfo]$fsInfo) {
+            if ($Time -ne $null) {
+                $fsInfo.CreationTime = $CurrentDateTime
+                $fsInfo.LastWriteTime = $CurrentDateTime
+                $fsInfo.LastAccessTime = $CurrentDateTime
+            } else {
+                if ($AccessTime.IsPresent) {
+                    $fsInfo.LastAccessTime = $CurrentDateTime
+                }
+                if ($ModificationTime.IsPresent) {
+                    $fsInfo.LastWriteTime = $CurrentDateTime
+                }
+                if ($CreationTime.IsPresent) {
+                    $fsInfo.CreationTime = $CurrentDateTime
+                }
+            }
+        }
+   
+        function Touch-NewFile {
+            [cmdletbinding(SupportsShouldProcess=$True)]
+            Param(
+                [Parameter(Mandatory=$True)][String]$FileName
+            )
+            if ($Force.IsPresent ) {
+                Set-Content -Path ($FileName) -Value ($null) -Force
+            } else {
+                Set-Content -Path ($FileName) -Value ($null)
+            }
+            $fsInfo = new-object System.IO.FileInfo($FileName)
+            return $fsInfo
+        }
 
+        if ($Replace -ne "") {
+            try {
+                $replaceInfo = Get-ChildItem $Replace
+                $CurrentDateTime = $replaceInfo.CreationTime
+            } catch {
+                return
+            }
+        } else {
+            if ($Time -ne "") {
+                $CurrentDateTime = [DateTime]::Parse($Time)
+            } else {
+                $CurrentDateTime = Get-Date            
+            }
+        }
+    }
+    process {
+        if ($pscmdlet.ShouldProcess($FileName)) {
+            if (test-path $FileName) {
+                $fsInfo = Get-ChildItem $FileName
+                Update-FileSystemInfo($fsInfo)
+            }
+            else {
+                if (!$Create.IsPresent) {
+                    $fsInfo = Touch-NewFile($FileName)
+                    $fsInfo = Get-ChildItem $FileName
+                    Update-FileSystemInfo($fsInfo)
+                }
+            }
+        }
+        $fsInfo = $null
+    }
+    end {
+    }
+}
+
+Function Ignore-WhatIf() {
+    Param(
+        [parameter(Mandatory=$True,Position=1)][scriptBlock]$ScriptBlock={$True}
+    )
+    $oldWhatIf=$WhatifPreference
+    $WhatifPreference=$False
+    invoke-command $ScriptBlock
+    $WhatifPreference=$oldWhatIf
+}
+# Initialize-File naming sucks for the 'touch' command but makes sense in the 
+# verb list and passes loading without errors, but lets alias to 'touch-file', ok!
+# Not setting alias to 'touch' to avoid 'hidding' your cygwn touch.exe, etc..., do 
+# that in your profile if you are not using another version of Touch on your system.
+Ignore-WhatIf { Set-Alias Touch-File Initialize-File -Scope Global }
 } # end of the Begin block (define code before use, but want to see the main block up front)
