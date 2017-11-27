@@ -255,6 +255,10 @@ end { # show the flow up front, but actually execute it last so that everything 
         }
     }
     Write-Progress -activity "ignored" -id 1 -Completed
+    if ($config.global.deltasEnabled) {
+        $deltaFolder = $config.global.deltaFolder -replace "/","\"
+        & explorer.exe /n,"$deltaFolder"
+    }
 }
 
 Begin { # define all the helper functions first, but save them to a later part of the file
@@ -310,17 +314,24 @@ Function Update-MirrorSite($GlobalConfig,$MirrorConfig) {
             Write-Warning "Removed partial/corrupted download of $($item.name)"
             Remove-Item $item.FullName
             $_
-        }
+        } 
         # otherwise, the item is already on disk and should not be downloaded again
     }
     Write-Progress -id 18 -Activity "Checking" -Completed
-    $retrievedFiles = Get-URIsInGroups -CacheFolder $cacheFolder `
-        -globalConfig $GlobalConfig -URIs $allRPMsLessCached.mirror_uri
-    if (!$retrievedFiles) {return $null}
+    $retrievedFiles=$Null
+    if ($allRPMsLessCached -and $allRPMsLessCached.count -gt 0) {
+        $retrievedFiles = Get-URIsInGroups -CacheFolder $cacheFolder `
+            -globalConfig $GlobalConfig -URIs $allRPMsLessCached.mirror_uri
+    }
+    # if no files were downloaded, then just stop now - unless we are going back in time
+    if (!$retrievedFiles -and $DaysBack -eq $Null) {return $null}
+    if ($DaysBack -ne $Null) { # $allRPMs is culled for just the last X days
+        $allRPMsLessCached = $allRPMs
+    }
     $allRPMsLessCached |% { 
         $rel = $_.localpath.replace($cachefolder,"") -replace "^\\",""
         $rel = $_.relativePath
-        if ($_.localpath -in $retrievedFiles) {
+        if ($_.localpath -in $retrievedFiles -or ( (test-path $_.localpath) -and $DaysBack -ne $Null ) ) {
             $files.Add($rel) | out-null
             Write-Verbose "Successfully retrieved $rel"
         } else {
@@ -408,7 +419,7 @@ Function Get-URIsInGroups($CacheFolder,$globalConfig,$URIs,[switch]$overwrite,[i
                     -Status "Group $($gc+1) of $($groups.count) ($groupsize files per group)" `
                     -PercentComplete ([int]($gc*100.0/$groups.count)); $gc++;
             }
-            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group 
+            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group -overwrite
         }
     } else {
         $destinations = $groups |%  { 
@@ -417,7 +428,7 @@ Function Get-URIsInGroups($CacheFolder,$globalConfig,$URIs,[switch]$overwrite,[i
                     -Status "Group $($gc+1) of $($groups.count) ($groupsize files per group)" `
                     -PercentComplete ([int]($gc*100.0/$groups.count)); $gc++;
             }
-            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group -overwrite
+            Get-URIs -CacheFolder $CacheFolder -globalConfig $globalConfig -URIs $_.group
         }
     }
     Write-Progress -id 20 -Activity "Download in groups" -Completed
@@ -458,6 +469,7 @@ Function Get-URIs($CacheFolder,$globalConfig,$URIs,[switch]$overwrite) {
 Function Get-RPMsInCatalog($catalogFiles,$mirrorSite,$CacheFolder,$DaysBack=$DaysBack) {
     $allRPMs = New-Object System.Collections.ArrayList
     $timesPast = (get-date (get-date -format "MM/dd/yyyy")).adddays(-$DaysBack); # 12:00am today - days back
+    $newestRPMDate=(get-date).addyears(-4); # anything in the last four years is way too old
     foreach ($cf in $catalogFiles) {
         $expandedCF = Expand-CatalogFile -PathName $cf
         if (! $expandedCF) {
@@ -485,6 +497,9 @@ Function Get-RPMsInCatalog($catalogFiles,$mirrorSite,$CacheFolder,$DaysBack=$Day
                     if ( $fileDate -lt $timesPast ) {
                         continue; # skip files older than $DaysBack
                     }
+                    if ($fileDate -gt $newestRPMDate) {
+                        $newestRPMDate = $fileDate
+                    }
                 }
              $t = measure-command {
                 $info = Create-FileInfo -href $rpmBlock.package.location.href -bytes $rpmBlock.package.size.package `
@@ -505,107 +520,23 @@ Function Get-RPMsInCatalog($catalogFiles,$mirrorSite,$CacheFolder,$DaysBack=$Day
         }
     }
     Write-Progress -id 10 -Activity "Reading RPM records" -Completed
+    if ($allRPMs.count -eq 0) {
+        Write-Warning ("No RPMS found in the last $DaysBack days. Newest RPM was published on {0} ({1} days ago)" `
+            -f $newestRPMDate,[int]((get-date)-$newestRPMDate).totaldays)
+    } else {
+        Write-Verbose ("Newest RPM was published on {0} ({1} day(s) ago)" -f $newestRPMDate,[int]((get-date)-$newestRPMDate).totaldays)
+    }
     Remove-Item $expandedCF
     return $allRPMs
 }
 
-Function Get-RPMBlockFromStreamOld($streamReader) {
-    # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
-    # approach #2 - try to make a terrible, by-hand extractor of XML data
-    # approach #3 - suck out just one record at a time, treat it like xml, and move on - SAX like
-    # Below is approach #3, but we have to be somewhat aware of the XML structure/tags
-    # with some band-aids to avoid dealing with namespaces
-    # Input variable is a StreamReader - don't want to suck in the whole file
-    $xml = New-Object XML
-    $packageXML=""
-    $preamble=""
-    $packageNum=0
-    $line=0; 
-    $gatherLines=$False
-    $NL="`n"; $tick=0
-    $result=$null
-    if (! (get-variable -scope script | where name -eq "__regexRPM" )) {       
-        $script:__regexRPM = @{
-            regexName=[regex]"<name>([^<]+)</name>";
-            regexPackageOpen=[regex]"<package( |>)";
-            regexIgnoreCrossref=[regex]"(<rpm:requires[^>]*>|<rpm:conflicts[^>]*>|<rpm:provides[^>]*>)";
-            regexSkipFiles=[regex]"<file[^>]*>.*</file>";
-            regexEmptyLine=[regex]"^\s*$";
-            regexCrossrefClose=[regex]"(</rpm:requires>|</rpm:requires>|</rpm:provides>)";
-            regexPackageClose=[regex]"</package>";
-            regexRPMOpen=[regex]"<rpm:";
-            regexRPMClose=[regex]"</rpm:";
-        }
-    }
-    $keepReading=$True
-    $totalIORead=0;
-    $tt = measure-command {
-    while ($KeepReading) {
-        $t = measure-command {$keepReading = ($s = $streamReader.ReadLine()) -ne $null }
-        $totalIORead += $t.totalmilliseconds
-        if ($keepReading -eq $false) { 
-            break }
-        $line+=1
-        #$perc = $streamReader.BaseStream.Position * 100.0 / $streamReader.BaseStream.Length
-        #if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
-        if ($s -match $script:__regexRPM.regexName) {  if ($matches[1] -like "kernel*") {
-            $tick = 1 }
-        }
-        if ($s -match $script:__regexRPM.regexPackageOpen ) {
-            $gatherLines=$True
-            $packageXML=$preamble  + $s + $NL
-            $packageNum+=1
-            continue
-        }
-        if ( $s -match $script:__regexRPM.regexIgnoreCrossref ) {
-            $gatherLines = $False
-            $s = $s -replace $matches[1],""
-            $packageXML +=  $s + $NL
-        }
-        $s = $s -replace $script:__regexRPM.regexSkipFiles,"" -replace $script:__regexRPM.regexEmptyLine,""
-        if ( $s -match $script:__regexRPM.regexCrossrefClose ) {
-            $gatherLines = $True
-            $s = $s -replace $matches[1],""
-        }
-        if ($gatherLines -eq $True -and $s -ne $NL) {
-            $packageXML += $s + $NL
-        }
-        if ($s -match $script:__regexRPM.regexPackageClose -and $gatherLines -eq $True) {
-            $gatherLines=$False
-            if ($tick -and $tick -eq 1) {
-                #Start-Sleep -Milliseconds 10
-            } 
-            try {
-                # rather than ensure that namespaces are imported, we doctor them
-                # up to just look like normal tags.  Repeat after me: "Not evil, but faster and cleaner code"
-                # since strings are easier to mangle than multiple namespace XML structures are to parse.
-                # and while we're at it, delete blank lines
-                $t = measure-command {
-                    $packageXML = ($packageXML  -replace $script:__regexRPM.regexRPMOpen,"<rpm-" `
-                            -replace $script:__regexRPM.regexRPMClose,"</rpm-")  `
-                            -creplace '(?m)^\s*\r?\n',''; 
-                    $xml.LoadXml( $packageXML )}
-                #Write-Verbose ("Parse Factor: {0,5}" -f [int]($t.TotalMilliseconds*1000/$packageXML.length))
-                $result=$xml
-                break
-            } catch {
-                Write-Error "Error reading XML from a catalog file, ending at line $line"
-                $result= $null
-                break
-            }
-        }
-    } # end of the while loop
-    } # end of measure command
-    #Write-Verbose ("Read/Block factor: {0,5} ({1})" -f `
-    #        [int]($tt.TotalMilliseconds*1000/$line), $result.package.name)
-    return $result
-}
 Function Get-RPMBlockFromStream($streamReader) {
     # approach #1 - just suck in the whole XML which is likely HUGE and slow to parse
     # approach #2 - try to make a terrible, by-hand extractor of XML data
     # approach #3 - suck out just one record at a time, treat it like xml, and move on - SAX like
     # Below is approach #3, but we have to be somewhat aware of the XML structure/tags
-    # with some band-aids to avoid dealing with namespaces
+    # with some band-aids to avoid dealing with namespaces.  Also strip out unused tags which
+    # slow down XML parsing into a DOM.
     # Input variable is a StreamReader - don't want to suck in the whole file
     $xml = New-Object XML
     $packageXML=""
@@ -626,8 +557,6 @@ Function Get-RPMBlockFromStream($streamReader) {
     while (($s = $streamReader.ReadLine()) -ne $null) {
         if ($lines.count -gt 5000 -and $lines.count % 250 -eq 0) { 
             Write-Host "Delays in reading: Line #$($lines.count)" }
-        #$perc = $streamReader.BaseStream.Position * 100.0 / $streamReader.BaseStream.Length
-        #if ($s -match "<\?xml") { $preamble += "$s$NL"; continue }
         #if ($s -match $script:__regexRPM.regexName) {  if ($matches[1] -like "kernel*") {
         #    $tick = 1 }
         #}
@@ -832,13 +761,14 @@ Function Get-NextZipFile([string]$ZipFolder,[string]$shortName) {
     if (! (get-variable -Scope Script | where Name -eq "__zipPartIndex" ) ) {
         $script:__zipPartIndex=1
     }
-    $pattern = join-path $ZipFolder "$shortName-{0:D2}.zip" 
-    Write-Verbose ("Checking for $shortName-{0:D2}.zip" -f $script:__zipPartIndex)
-    while ((test-path ($pattern -f $script:__zipPartIndex)) -eq $True) {
-        Write-Verbose ("Skipping over existing archive $shortName-{0:D2}.zip" -f $script:__zipPartIndex)
+    $today=get-date -format "yyyyMMdd"
+    $pattern = join-path $ZipFolder "$shortName-{1}-{0:D2}.zip" 
+    Write-Verbose ("Checking for $shortName-{1}-{0:D2}.zip" -f $script:__zipPartIndex,$today)
+    while ((test-path ($pattern -f $script:__zipPartIndex,$today)) -eq $True) {
+        Write-Verbose ("Skipping over existing archive $shortName-{1}-{0:D2}.zip" -f $script:__zipPartIndex,$today)
         $script:__zipPartIndex++
     }
-    return ($pattern -f $script:__zipPartIndex++)
+    return ($pattern -f $script:__zipPartIndex++,$today)
 }
 
 Function Split-FilesForZipping([string]$cachePath,[string []]$files,[int64]$maxBytes) {
